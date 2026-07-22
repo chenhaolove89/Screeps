@@ -1,9 +1,11 @@
+var sourceCache = require('cache.sources');
+
 var roleRepairer = {
 
     /** @param {Creep} creep **/
     run: function (creep) {
-        // 状态切换
-        if (creep.memory.repairing && creep.store[RESOURCE_ENERGY] == 0) {
+        // 状态切换：修理消耗 1 能量/tick/WORK 部件，能量 < 1 时无法修理
+        if (creep.memory.repairing && creep.store[RESOURCE_ENERGY] < 1) {
             creep.memory.repairing = false;
             creep.say('🔄 采集');
         }
@@ -26,8 +28,13 @@ var roleRepairer = {
             targets.sort((a, b) => a.hits - b.hits);
 
             if (targets.length > 0) {
-                if (creep.repair(targets[0]) == ERR_NOT_IN_RANGE) {
+                var repairResult = creep.repair(targets[0]);
+                if (repairResult == ERR_NOT_IN_RANGE) {
                     creep.moveTo(targets[0], { visualizePathStyle: { stroke: '#ffffff' } });
+                } else if (repairResult == ERR_NOT_ENOUGH_ENERGY) {
+                    // 能量不足时切回采集
+                    creep.memory.repairing = false;
+                    creep.say('🔄 缺能');
                 }
             } else {
                 // 没有需要修理的建筑时，去升级控制器
@@ -39,32 +46,39 @@ var roleRepairer = {
         // 采集模式
         else {
             // 优先从 Spawn/Extension 取能量
-            var sources = creep.room.find(FIND_STRUCTURES, {
+            var structures = creep.room.find(FIND_STRUCTURES, {
                 filter: (structure) => {
                     return (structure.structureType == STRUCTURE_SPAWN ||
                             structure.structureType == STRUCTURE_EXTENSION) &&
                         structure.store[RESOURCE_ENERGY] > 0;
                 }
             });
-            if (sources.length == 0) {
+            if (structures.length == 0) {
                 // 从 Container 取
-                sources = creep.room.find(FIND_STRUCTURES, {
+                structures = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
                         return structure.structureType == STRUCTURE_CONTAINER &&
                             structure.store[RESOURCE_ENERGY] > 0;
                     }
                 });
             }
-            if (sources.length > 0) {
-                if (creep.withdraw(sources[0], RESOURCE_ENERGY) == ERR_NOT_IN_RANGE) {
-                    creep.moveTo(sources[0], { visualizePathStyle: { stroke: '#ffaa00' } });
+
+            var acted = false;
+            for (var i = 0; i < structures.length; i++) {
+                var wd = creep.withdraw(structures[i], RESOURCE_ENERGY);
+                if (wd == ERR_NOT_IN_RANGE) {
+                    creep.moveTo(structures[i], { visualizePathStyle: { stroke: '#ffaa00' } });
+                    acted = true;
+                    break;
+                } else if (wd == OK) {
+                    acted = true;
+                    break;
                 }
-            } else {
-                // 最后手段：自己去采集
-                var source = creep.room.find(FIND_SOURCES)[0];
-                if (creep.harvest(source) == ERR_NOT_IN_RANGE) {
-                    creep.moveTo(source, { visualizePathStyle: { stroke: '#ffaa00' } });
-                }
+            }
+
+            if (!acted) {
+                // 最后手段：直接用缓存矿点采集
+                sourceCache.harvestNearest(creep);
             }
         }
     }

@@ -66,38 +66,23 @@ var managerSpawn = {
 
     /**
      * 根据可用能量生成合适的 creep 身体部件
+     * 每"单元" = [WORK, CARRY, MOVE]，成本 = 100+50+50 = 200
+     * 数学保证总成本 <= energy
      */
     getBody: function (energy, role) {
-        var workParts  = 1;
-        var carryParts = 1;
-        var moveParts  = 1;
+        var n = 1;  // 默认 1 单元，成本 200
 
         if (energy >= 300) {
-            switch (role) {
-                case 'harvester':
-                    workParts  = Math.floor(energy / 100);
-                    carryParts = Math.min(Math.floor(energy / 50), workParts);
-                    moveParts  = Math.ceil((workParts + carryParts) / 2);
-                    break;
-                case 'upgrader':
-                case 'builder':
-                case 'repairer':
-                default:
-                    workParts  = Math.floor(energy / 130);
-                    carryParts = workParts;
-                    moveParts  = workParts;
-                    break;
-            }
-
-            workParts  = Math.min(workParts,  8);
-            carryParts = Math.min(carryParts, 8);
-            moveParts  = Math.min(moveParts,  8);
+            // 每单元 [WORK, CARRY, MOVE] = 200 energy
+            n = Math.floor(energy / 200);
+            n = Math.min(n, 8);  // 最多 8 单元（24 parts, 1600 energy）
         }
+        // energy < 300: n=1，成本 200，恰好满足 spawnEnergyThreshold
 
         var body = [];
-        for (var i = 0; i < workParts;  i++) body.push(WORK);
-        for (var i = 0; i < carryParts; i++) body.push(CARRY);
-        for (var i = 0; i < moveParts;  i++) body.push(MOVE);
+        for (var i = 0; i < n; i++) body.push(WORK);
+        for (var i = 0; i < n; i++) body.push(CARRY);
+        for (var i = 0; i < n; i++) body.push(MOVE);
         return body;
     }
 };

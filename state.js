@@ -20,6 +20,17 @@ var state = {
 
     /** @type {boolean} 缓存是否已初始化 */
     _cacheReady: false,
+
+    // ── 矿点缓存 ──────────────────────────────────────────
+
+    /** @type {string[]} 所有矿点 ID 列表（房间固定，首次 tick 初始化） */
+    sourceIds: [],
+
+    /** @type {Object.<string, {x: number, y: number, roomName: string}>} 矿点坐标缓存 */
+    sourceData: {},
+
+    /** @type {Object.<string, boolean>} 每 tick 矿点是否有空闲相邻格的缓存（key: sourceId, value: true=有空位） */
+    sourceSlotFree: {},
 };
 
 module.exports = state;

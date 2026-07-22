@@ -8,9 +8,19 @@ var creepCache    = require('cache.creep');
 
 module.exports.loop = function () {
 
-    // ── 首次运行：全量构建 Creep 缓存 ──
+    // 每 tick 重置矿点饱和检测缓存（瞬态，不跨 tick）
+    state.sourceSlotFree = {};
+
+    // ── 首次运行：全量构建缓存 ──
     if (!state._cacheReady) {
         creepCache.build();
+        // 构建矿点缓存（房间固定，只需初始化一次）
+        var sources = Game.spawns['Spawn1'].room.find(FIND_SOURCES);
+        for (var si = 0; si < sources.length; si++) {
+            var s = sources[si];
+            state.sourceIds.push(s.id);
+            state.sourceData[s.id] = { x: s.pos.x, y: s.pos.y, roomName: s.pos.roomName };
+        }
     }
 
     // ── 防御塔 ──

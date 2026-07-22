@@ -6,7 +6,7 @@ module.exports = {
 
     // 各角色目标数量
     roleTargets: {
-        harvester: 3,
+        harvester: 8,
         upgrader:  2,
         builder:   2,
         repairer:  0,
