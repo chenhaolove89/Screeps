@@ -1,3 +1,5 @@
+var state = require('state');
+
 var roleUpgrader = {
 
     /** @param {Creep} creep **/
@@ -15,13 +17,17 @@ var roleUpgrader = {
 
         // 升级模式：去控制器处升级
         if (creep.memory.upgrading) {
+            // 角色短缺时暂停升级，优先保证孵化
+            if (state.creepShortage) {
+                creep.say('⏸ 缺人');
+                return;
+            }
             if (creep.upgradeController(creep.room.controller) == ERR_NOT_IN_RANGE) {
                 creep.moveTo(creep.room.controller, { visualizePathStyle: { stroke: '#ffffff' } });
             }
         }
         // 装能量模式：从 Spawn/Extension/Container 获取能量
         else {
-            // 优先从 Spawn 和 Extension 取能量
             var sources = creep.room.find(FIND_STRUCTURES, {
                 filter: (structure) => {
                     return (structure.structureType == STRUCTURE_SPAWN ||
@@ -30,7 +36,6 @@ var roleUpgrader = {
                 }
             });
             if (sources.length == 0) {
-                // 如果 Spawn/Extension 没能量，从 Container 取
                 sources = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
                         return structure.structureType == STRUCTURE_CONTAINER &&
@@ -43,7 +48,6 @@ var roleUpgrader = {
                     creep.moveTo(sources[0], { visualizePathStyle: { stroke: '#ffaa00' } });
                 }
             } else {
-                // 最后手段：自己去采集
                 var source = creep.room.find(FIND_SOURCES)[0];
                 if (creep.harvest(source) == ERR_NOT_IN_RANGE) {
                     creep.moveTo(source, { visualizePathStyle: { stroke: '#ffaa00' } });

@@ -3,8 +3,15 @@ var roleUpgrader  = require('role.upgrader');
 var roleBuilder   = require('role.builder');
 var roleRepairer  = require('role.repairer');
 var managerSpawn  = require('manager.spawn');
+var state         = require('state');
+var creepCache    = require('cache.creep');
 
 module.exports.loop = function () {
+
+    // ── 首次运行：全量构建 Creep 缓存 ──
+    if (!state._cacheReady) {
+        creepCache.build();
+    }
 
     // ── 防御塔 ──
     var towers = _.filter(Game.structures, s => s.structureType == STRUCTURE_TOWER);
@@ -23,16 +30,24 @@ module.exports.loop = function () {
         }
     }
 
-    // ── 清理死亡 Creep 内存 ──
+    // ── 清理死亡 Creep 内存 + 同步缓存 ──
     for (var name in Memory.creeps) {
         if (!Game.creeps[name]) {
+            creepCache.remove(name);
             delete Memory.creeps[name];
         }
     }
 
-    // ── 角色调度 ──
-    for (var name in Game.creeps) {
-        var creep = Game.creeps[name];
+    // ── 检测角色是否短缺（用缓存，无需 _.filter） ──
+    state.creepShortage = managerSpawn.checkShortage();
+    state.spawningRole  = null;
+
+    // ── 角色调度（用缓存的 allNames 避免 for...in Game.creeps） ──
+    var names = state.allNames;
+    for (var i = 0; i < names.length; i++) {
+        var creep = Game.creeps[names[i]];
+        // 极端情况：刚死亡但缓存未及时清理，跳过
+        if (!creep) continue;
         switch (creep.memory.role) {
             case 'harvester': roleHarvester.run(creep); break;
             case 'upgrader':  roleUpgrader.run(creep);  break;

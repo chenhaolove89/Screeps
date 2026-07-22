@@ -1,3 +1,5 @@
+var state = require('state');
+
 var roleBuilder = {
 
     /** @param {Creep} creep **/
@@ -15,6 +17,11 @@ var roleBuilder = {
 
         // 建造模式
         if (creep.memory.building) {
+            // 角色短缺时暂停建造，优先保证孵化
+            if (state.creepShortage) {
+                creep.say('⏸ 缺人');
+                return;
+            }
             // 查找建筑工地
             var targets = creep.room.find(FIND_CONSTRUCTION_SITES);
             if (targets.length) {
@@ -39,7 +46,6 @@ var roleBuilder = {
                 }
             });
             if (sources.length == 0) {
-                // 从 Container 取
                 sources = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
                         return structure.structureType == STRUCTURE_CONTAINER &&
@@ -52,7 +58,6 @@ var roleBuilder = {
                     creep.moveTo(sources[0], { visualizePathStyle: { stroke: '#ffaa00' } });
                 }
             } else {
-                // 最后手段：自己去采集
                 var source = creep.room.find(FIND_SOURCES)[0];
                 if (creep.harvest(source) == ERR_NOT_IN_RANGE) {
                     creep.moveTo(source, { visualizePathStyle: { stroke: '#ffaa00' } });
