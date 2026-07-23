@@ -20,10 +20,12 @@ var managerSpawn = {
 
         // 按优先级检查各角色缺口（读缓存，O(1)）
         var queue = [
-            { role: 'harvester', need: targets.harvester },
-            { role: 'upgrader',  need: targets.upgrader  },
-            { role: 'builder',   need: targets.builder   },
-            { role: 'repairer',  need: targets.repairer  },
+            { role: 'harvester',   need: targets.harvester   },
+            { role: 'collector',   need: targets.collector   },
+            { role: 'transporter', need: targets.transporter },
+            { role: 'upgrader',    need: targets.upgrader    },
+            { role: 'builder',     need: targets.builder     },
+            { role: 'repairer',    need: targets.repairer    },
         ];
 
         for (var i = 0; i < queue.length; i++) {

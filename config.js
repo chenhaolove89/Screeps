@@ -6,10 +6,12 @@ module.exports = {
 
     // 各角色目标数量
     roleTargets: {
-        harvester: 8,
-        upgrader:  2,
-        builder:   2,
-        repairer:  0,
+        harvester:  2,
+        collector:  4,
+        transporter: 4,
+        upgrader:   2,
+        builder:    2,
+        repairer:   0,
     },
 
     // 孵化能量门槛（低于此值不孵化）

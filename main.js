@@ -1,10 +1,12 @@
-var roleHarvester = require('role.harvester');
-var roleUpgrader  = require('role.upgrader');
-var roleBuilder   = require('role.builder');
-var roleRepairer  = require('role.repairer');
-var managerSpawn  = require('manager.spawn');
-var state         = require('state');
-var creepCache    = require('cache.creep');
+var roleHarvester   = require('role.harvester');
+var roleCollector   = require('role.collector');
+var roleTransporter = require('role.transporter');
+var roleUpgrader    = require('role.upgrader');
+var roleBuilder     = require('role.builder');
+var roleRepairer    = require('role.repairer');
+var managerSpawn    = require('manager.spawn');
+var state           = require('state');
+var creepCache      = require('cache.creep');
 
 module.exports.loop = function () {
 
@@ -59,10 +61,12 @@ module.exports.loop = function () {
         // 极端情况：刚死亡但缓存未及时清理，跳过
         if (!creep) continue;
         switch (creep.memory.role) {
-            case 'harvester': roleHarvester.run(creep); break;
-            case 'upgrader':  roleUpgrader.run(creep);  break;
-            case 'builder':   roleBuilder.run(creep);   break;
-            case 'repairer':  roleRepairer.run(creep);  break;
+            case 'harvester':   roleHarvester.run(creep);   break;
+            case 'collector':   roleCollector.run(creep);   break;
+            case 'transporter': roleTransporter.run(creep); break;
+            case 'upgrader':    roleUpgrader.run(creep);    break;
+            case 'builder':     roleBuilder.run(creep);     break;
+            case 'repairer':    roleRepairer.run(creep);    break;
         }
     }
 
