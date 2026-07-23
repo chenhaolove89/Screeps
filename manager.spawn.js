@@ -4,6 +4,7 @@
  */
 var config = require('config');
 var creepCache = require('cache.creep');
+var bodyConfig = require('body.config');
 
 var managerSpawn = {
 
@@ -17,6 +18,15 @@ var managerSpawn = {
 
         var energy = spawn.room.energyAvailable;
         var targets = config.roleTargets;
+
+        // 基础劳动力充足且能量供应链正常时，等待高能量再孵化
+        if (managerSpawn._canWaitForHighEnergy(spawn, targets)) {
+            var capacity = spawn.room.energyCapacityAvailable;
+            var highThreshold = capacity * 0.8;
+            if (energy < highThreshold) {
+                return; // 等待更多能量，孵化更高级 creep
+            }
+        }
 
         // 按优先级检查各角色缺口（读缓存，O(1)）
         var queue = [
@@ -67,25 +77,40 @@ var managerSpawn = {
     },
 
     /**
-     * 根据可用能量生成合适的 creep 身体部件
-     * 每"单元" = [WORK, CARRY, MOVE]，成本 = 100+50+50 = 200
-     * 数学保证总成本 <= energy
+     * 判断是否满足等待高能量孵化的条件
+     * @param {Spawn} spawn
+     * @param {Object} targets
+     * @returns {boolean} true=可以等待高能量
+     */
+    _canWaitForHighEnergy: function (spawn, targets) {
+        var collectorCount = creepCache.count('collector');
+        var transporterCount = creepCache.count('transporter');
+
+        // 采集者 + 搬运者总数不低于目标一半
+        if (collectorCount + transporterCount < (targets.collector + targets.transporter) / 2) {
+            return false;
+        }
+
+        // 必须有搬运者
+        if (transporterCount === 0) {
+            return false;
+        }
+
+        // Container 中必须有能量
+        var containers = spawn.room.find(FIND_STRUCTURES, {
+            filter: function (s) {
+                return s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] > 0;
+            }
+        });
+        return containers.length > 0;
+    },
+
+    /**
+     * 根据可用能量和角色生成最优的 creep 身体部件
+     * 使用差异化的部件配置策略,根据角色职责优化性能
      */
     getBody: function (energy, role) {
-        var n = 1;  // 默认 1 单元，成本 200
-
-        if (energy >= 300) {
-            // 每单元 [WORK, CARRY, MOVE] = 200 energy
-            n = Math.floor(energy / 200);
-            n = Math.min(n, 8);  // 最多 8 单元（24 parts, 1600 energy）
-        }
-        // energy < 300: n=1，成本 200，恰好满足 spawnEnergyThreshold
-
-        var body = [];
-        for (var i = 0; i < n; i++) body.push(WORK);
-        for (var i = 0; i < n; i++) body.push(CARRY);
-        for (var i = 0; i < n; i++) body.push(MOVE);
-        return body;
+        return bodyConfig.getBody(energy, role);
     }
 };
 

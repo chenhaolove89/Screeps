@@ -1,9 +1,15 @@
-var sourceCache = require('cache.sources');
+var sourceCache   = require('cache.sources');
+var taskScheduler = require('task.scheduler');
 
 var roleRepairer = {
 
     /** @param {Creep} creep **/
     run: function (creep) {
+        // ── 让位检查(被采集者请求让位时优先执行) ──
+        if (taskScheduler.checkYield(creep)) {
+            return;
+        }
+
         // 状态切换：修理消耗 1 能量/tick/WORK 部件，能量 < 1 时无法修理
         if (creep.memory.repairing && creep.store[RESOURCE_ENERGY] < 1) {
             creep.memory.repairing = false;
@@ -45,19 +51,19 @@ var roleRepairer = {
         }
         // 采集模式
         else {
-            // 优先从 Spawn/Extension 取能量
+            // 优先从 Container 取能量
             var structures = creep.room.find(FIND_STRUCTURES, {
                 filter: (structure) => {
-                    return (structure.structureType == STRUCTURE_SPAWN ||
-                            structure.structureType == STRUCTURE_EXTENSION) &&
+                    return structure.structureType == STRUCTURE_CONTAINER &&
                         structure.store[RESOURCE_ENERGY] > 0;
                 }
             });
             if (structures.length == 0) {
-                // 从 Container 取
+                // 从 Spawn/Extension 取
                 structures = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
-                        return structure.structureType == STRUCTURE_CONTAINER &&
+                        return (structure.structureType == STRUCTURE_SPAWN ||
+                                structure.structureType == STRUCTURE_EXTENSION) &&
                             structure.store[RESOURCE_ENERGY] > 0;
                     }
                 });

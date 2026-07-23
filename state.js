@@ -31,6 +31,12 @@ var state = {
 
     /** @type {Object.<string, boolean>} 每 tick 矿点是否有空闲相邻格的缓存（key: sourceId, value: true=有空位） */
     sourceSlotFree: {},
+
+    /** @type {Object.<string, number>} 每 tick 矿点空闲相邻格数量的缓存（key: sourceId, value: 空闲格子数） */
+    sourceSlotCount: {},
+
+    /** @type {Object.<string, number>} 矿点到 Spawn 的距离缓存（key: sourceId, value: 距离） */
+    sourceSpawnDist: {},
 };
 
 module.exports = state;

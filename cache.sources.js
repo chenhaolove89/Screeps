@@ -33,9 +33,62 @@ var sourceCache = {
      * @returns {boolean} true=有空位可入位采集
      */
     hasFreeSlot: function (source) {
+        return this.getFreeSlotCount(source) > 0;
+    },
+
+    /**
+     * 获取矿点到 Spawn 的距离（缓存）
+     * @param {Source} source
+     * @returns {number} 距离（Chebyshev）
+     */
+    getSpawnDistance: function (source) {
         var sid = source.id;
-        if (state.sourceSlotFree.hasOwnProperty(sid)) {
-            return state.sourceSlotFree[sid];
+        if (state.sourceSpawnDist.hasOwnProperty(sid)) {
+            return state.sourceSpawnDist[sid];
+        }
+        var spawn = source.room.find(FIND_STRUCTURES, {
+            filter: function (s) { return s.structureType == STRUCTURE_SPAWN; }
+        })[0];
+        if (!spawn) {
+            state.sourceSpawnDist[sid] = Infinity;
+            return Infinity;
+        }
+        var dist = Math.max(
+            Math.abs(source.pos.x - spawn.pos.x),
+            Math.abs(source.pos.y - spawn.pos.y)
+        );
+        state.sourceSpawnDist[sid] = dist;
+        return dist;
+    },
+
+    /**
+     * 返回按到 Spawn 距离排序的矿点列表（近→远）
+     * @param {Room} room
+     * @returns {Source[]}
+     */
+    getSourcesBySpawnDistance: function (room) {
+        var ids = state.sourceIds;
+        var result = [];
+        for (var i = 0; i < ids.length; i++) {
+            var source = Game.getObjectById(ids[i]);
+            if (!source) continue;
+            result.push(source);
+        }
+        result.sort(function (a, b) {
+            return this.getSpawnDistance(a) - this.getSpawnDistance(b);
+        }.bind(this));
+        return result;
+    },
+
+    /**
+     * 获取矿点周围空闲可站立格的数量
+     * @param {Source} source
+     * @returns {number} 空闲格子数量（0-8）
+     */
+    getFreeSlotCount: function (source) {
+        var sid = source.id;
+        if (state.sourceSlotCount.hasOwnProperty(sid)) {
+            return state.sourceSlotCount[sid];
         }
 
         var sx = source.pos.x, sy = source.pos.y;
@@ -55,19 +108,18 @@ var sourceCache = {
             }
         }
 
-        var hasFree = false;
-        for (var dx = -1; dx <= 1 && !hasFree; dx++) {
+        var count = 0;
+        for (var dx = -1; dx <= 1; dx++) {
             for (var dy = -1; dy <= 1; dy++) {
                 if (dx == 0 && dy == 0) continue;
                 if (!blocked[(sx + dx) + ',' + (sy + dy)]) {
-                    hasFree = true;
-                    break;
+                    count++;
                 }
             }
         }
 
-        state.sourceSlotFree[sid] = hasFree;
-        return hasFree;
+        state.sourceSlotCount[sid] = count;
+        return count;
     },
 
     /**

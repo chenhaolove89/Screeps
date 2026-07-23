@@ -38,18 +38,21 @@ var CACHE_TTL = 5;
 
 /** 结构体优先级权重（数字越小优先级越高） */
 var DELIVERY_PRIORITY = {
-    spawn:     1,
-    extension: 2,
+    extension: 1,  // 优先填充 Extension 以支持高资源 creep 孵化
+    spawn:     2,
     tower:     3,
     storage:   4,
     container: 5,
 };
 
 /** Spawn 低能量阈值 */
-var SPAWN_LOW_ENERGY = 300;
+var SPAWN_LOW_ENERGY = 200;
 
 /** Tower 低能量阈值 */
 var TOWER_LOW_ENERGY = 500;
+
+/** 最小搬运资源阈值（低于此值忽略，避免搬运者守着采集者） */
+var MIN_PICKUP_AMOUNT = 20;
 
 // ── Room 级缓存 ─────────────────────────────────────────
 var _cache = {
@@ -63,6 +66,11 @@ var roleTransporter = {
     /** @param {Creep} creep */
     run: function (creep) {
         var logCtx = '[' + creep.name + ']';
+
+        // ── 让位检查(被采集者请求让位时优先执行) ──
+        if (taskScheduler.checkYield(creep)) {
+            return;
+        }
 
         // 初始化阶段追踪（空=需要取货, carry=正在搬运中）
         if (!creep.memory._transportPhase) {
@@ -82,6 +90,7 @@ var roleTransporter = {
             creep.memory._pickupId = null;
             creep.memory.transporterState = 'GET_TASK';
             phase = 'empty';
+            creep.say('🔄 取货');
         }
 
         // 身上装满了 → 进入送货阶段（只在之前不是送货阶段时切换）
@@ -90,6 +99,7 @@ var roleTransporter = {
             creep.memory._deliverId = null;
             creep.memory.transporterState = 'DELIVERING';
             phase = 'carry';
+            creep.say('📦 送货');
         }
 
         // ── 状态机（按阶段分别处理） ──
@@ -188,9 +198,32 @@ var roleTransporter = {
             return;
         }
 
+        // 如果站在目标上，先移开一格
+        if (creep.pos.isEqualTo(target.pos)) {
+            this._moveAwayFromTarget(creep, target);
+            return;
+        }
+
+        // 检查是否站在其他结构上（如 Container），需要先移开
+        var structuresAtPos = creep.room.lookForAt(LOOK_STRUCTURES, creep.pos);
+        if (structuresAtPos.length > 0) {
+            var isOnTarget = false;
+            for (var j = 0; j < structuresAtPos.length; j++) {
+                if (structuresAtPos[j].id === target.id) {
+                    isOnTarget = true;
+                    break;
+                }
+            }
+            if (!isOnTarget) {
+                this._moveAwayFromTarget(creep, target);
+                return;
+            }
+        }
+
         var moveResult = creep.moveTo(target, {
             visualizePathStyle: { stroke: '#ffaa00', lineStyle: 'dotted' },
             reusePath: 20,
+            ignoreCreeps: false,  // 允许绕过其他 creep，避免被包围
         });
 
         // 只有不可达错误才算真正失败，其他情况（如 TIRED、未到位等）继续尝试
@@ -218,8 +251,17 @@ var roleTransporter = {
             return;
         }
 
+        var isDropped = !!target.resourceType;
+        var resourceAmount = isDropped ? target.amount : target.store[RESOURCE_ENERGY];
+        if (resourceAmount < MIN_PICKUP_AMOUNT) {
+            this._log(LOG_LEVEL.DEBUG, logCtx + ' 资源不足(' + resourceAmount + '), 放弃取货点');
+            this._releasePickupLock(pickupId, creep.name);
+            creep.memory._pickupId = null;
+            creep.memory.transporterState = 'GET_TASK';
+            return;
+        }
+
         var result;
-        var isDropped = !!target.resourceType; // 地面掉落资源
 
         if (isDropped) {
             result = creep.pickup(target);
@@ -230,13 +272,21 @@ var roleTransporter = {
 
         if (result === OK) {
             this._log(LOG_LEVEL.DEBUG, logCtx + ' 取货成功: ' + pickupId);
+            // 只有加过锁的目标才需要释放锁（资源 < 500 的 Container 才会加锁）
+            if (!target.structureType || target.store[RESOURCE_ENERGY] < 500) {
+                this._releasePickupLock(pickupId, creep.name);
+            }
             creep.memory._pickupId = null;
 
-            // 检查容量：满了就去送货，否则继续取
+            // 检查容量：满了才去送货；未满则切回 GET_TASK 继续找取货点
+            // (修复"上上下下"bug:此前两个分支都进入 DELIVERING,
+            //  导致 withdraw 一点就跑去送货,造成 Container↔Spawn 往返抖动)
             if (creep.store.getFreeCapacity() === 0) {
+                creep.memory._transportPhase = 'carry';
                 creep.memory.transporterState = 'DELIVERING';
                 this._doDelivery(creep, logCtx);
             } else {
+                // 未满,继续在 empty 阶段,下一 tick 重新选最近取货点
                 creep.memory.transporterState = 'GET_TASK';
             }
 
@@ -312,9 +362,32 @@ var roleTransporter = {
             return;
         }
 
+        // 如果站在目标上或其他结构上，先移开一格
+        if (creep.pos.isEqualTo(target.pos)) {
+            this._moveAwayFromTarget(creep, target);
+            return;
+        }
+
+        // 检查是否站在结构上（如 Container），需要先移开
+        var structuresAtPos = creep.room.lookForAt(LOOK_STRUCTURES, creep.pos);
+        if (structuresAtPos.length > 0) {
+            var isOnTarget = false;
+            for (var j = 0; j < structuresAtPos.length; j++) {
+                if (structuresAtPos[j].id === target.id) {
+                    isOnTarget = true;
+                    break;
+                }
+            }
+            if (!isOnTarget) {
+                this._moveAwayFromTarget(creep, target);
+                return;
+            }
+        }
+
         var moveResult = creep.moveTo(target, {
             visualizePathStyle: { stroke: '#ffffff', lineStyle: 'dashed' },
             reusePath: 20,
+            ignoreCreeps: false,  // 允许绕过其他 creep，避免被包围
         });
 
         // 只有不可达错误才算真正失败
@@ -331,6 +404,7 @@ var roleTransporter = {
         var result = creep.transfer(target, RESOURCE_ENERGY);
 
         if (result === OK) {
+            this._releaseDeliverLock(creep.memory._deliverId, creep.name);
             // 更新任务进度
             var carried = creep.store.getUsedCapacity(RESOURCE_ENERGY);
             var capacity = creep.store.getCapacity(RESOURCE_ENERGY);
@@ -405,7 +479,7 @@ var roleTransporter = {
         // 2. Tombstone / Ruin
         var tombstones = this._getCachedTombstones(room);
         for (var j = 0; j < tombstones.length; j++) {
-            if (tombstones[j].store[RESOURCE_ENERGY] > 0) {
+            if (tombstones[j].store[RESOURCE_ENERGY] >= MIN_PICKUP_AMOUNT) {
                 if (!this._isPickupLocked(tombstones[j].id)) {
                     this._lockPickup(tombstones[j].id, creep.name);
                     return tombstones[j];
@@ -414,16 +488,18 @@ var roleTransporter = {
         }
 
         // 3. Container（有能量且非空）
+        // 资源 >= 500 时不加锁，支持多个搬运者同时搬运
         var structures = this._getCachedStructures(room);
         for (var k = 0; k < structures.length; k++) {
             var s = structures[k];
-            if (
-                s.structureType === STRUCTURE_CONTAINER &&
-                s.store[RESOURCE_ENERGY] >= 100 &&
-                !this._isPickupLocked(s.id)
-            ) {
-                this._lockPickup(s.id, creep.name);
-                return s;
+            if (s.structureType === STRUCTURE_CONTAINER && s.store[RESOURCE_ENERGY] >= 100) {
+                if (s.store[RESOURCE_ENERGY] >= 500) {
+                    return s;
+                }
+                if (!this._isPickupLocked(s.id)) {
+                    this._lockPickup(s.id, creep.name);
+                    return s;
+                }
             }
         }
 
@@ -445,7 +521,8 @@ var roleTransporter = {
 
     /**
      * 找到最优送货目标
-     * 优先级：Spawn低能量 > Extension未满 > Tower低能量 > Storage
+     * 优先级：Extension未满 > Spawn低能量 > Tower低能量 > Storage
+     * 优先填充 Extension 以保证孵化高资源 creep 的容量
      */
     _findBestDelivery: function (creep) {
         var room = creep.room;
@@ -487,14 +564,18 @@ var roleTransporter = {
             return b.freeCap - a.freeCap;
         });
 
-        if (candidates.length > 0 && !this._isDeliverLocked(candidates[0].target.id)) {
-            this._lockDeliver(candidates[0].target.id, creep.name);
-            return candidates[0].target;
+        // 遍历候选列表，找到第一个未达到锁定上限的收货方
+        for (var j = 0; j < candidates.length; j++) {
+            var candidate = candidates[j];
+            if (!this._isDeliverLocked(candidate.target.id)) {
+                this._lockDeliver(candidate.target.id, creep.name);
+                return candidate.target;
+            }
         }
 
-        // 兜底：Storage（如果所有消费端都满了）
-        for (var j = 0; j < structures.length; j++) {
-            var ss = structures[j];
+        // 兜底：Storage（如果所有消费端都满了或都被锁定）
+        for (var k = 0; k < structures.length; k++) {
+            var ss = structures[k];
             if (
                 ss.structureType === STRUCTURE_STORAGE &&
                 ss.store.getFreeCapacity(RESOURCE_ENERGY) > 0 &&
@@ -519,10 +600,16 @@ var roleTransporter = {
         if (!Memory._transporterLocks) Memory._transporterLocks = { pickups: {}, delivers: {} };
         var lock = Memory._transporterLocks.pickups[id];
         if (!lock) return false;
-        // 验证持有锁的 creep 仍存活
         if (!Game.creeps[lock]) {
             delete Memory._transporterLocks.pickups[id];
             return false;
+        }
+        if (Memory._transporterLockTimestamps && Memory._transporterLockTimestamps[id]) {
+            if (Game.time - Memory._transporterLockTimestamps[id] > 30) {
+                delete Memory._transporterLocks.pickups[id];
+                delete Memory._transporterLockTimestamps[id];
+                return false;
+            }
         }
         return true;
     },
@@ -533,42 +620,205 @@ var roleTransporter = {
     _lockPickup: function (id, creepName) {
         if (!Memory._transporterLocks) Memory._transporterLocks = { pickups: {}, delivers: {} };
         Memory._transporterLocks.pickups[id] = creepName;
+        if (!Memory._transporterLockTimestamps) Memory._transporterLockTimestamps = {};
+        Memory._transporterLockTimestamps[id] = Game.time;
     },
 
     /**
-     * 检查送货目标是否已被锁定
+     * 检查送货目标是否已被锁定（支持最多 3 个搬运者同时锁定）
      */
     _isDeliverLocked: function (id) {
+        var MAX_LOCKS_PER_DELIVER = 3;
         if (!Memory._transporterLocks) Memory._transporterLocks = { pickups: {}, delivers: {} };
-        var lock = Memory._transporterLocks.delivers[id];
-        if (!lock) return false;
-        if (!Game.creeps[lock]) {
-            delete Memory._transporterLocks.delivers[id];
-            return false;
+        
+        var locks = Memory._transporterLocks.delivers[id];
+        if (!locks) return false;
+        
+        // 兼容旧格式（字符串）→ 转换为数组
+        if (typeof locks === 'string') {
+            locks = [locks];
+            Memory._transporterLocks.delivers[id] = locks;
         }
-        return true;
+        
+        // 清理无效锁定（已死亡的 creep）
+        var validLocks = [];
+        for (var i = 0; i < locks.length; i++) {
+            if (Game.creeps[locks[i]]) {
+                validLocks.push(locks[i]);
+            }
+        }
+        
+        if (validLocks.length !== locks.length) {
+            Memory._transporterLocks.delivers[id] = validLocks;
+            locks = validLocks;
+        }
+        
+        // 清理超时锁定
+        if (Memory._transporterLockTimestamps && Memory._transporterLockTimestamps[id]) {
+            if (Game.time - Memory._transporterLockTimestamps[id] > 30) {
+                delete Memory._transporterLocks.delivers[id];
+                delete Memory._transporterLockTimestamps[id];
+                return false;
+            }
+        }
+        
+        // 检查是否达到锁定上限
+        return locks.length >= MAX_LOCKS_PER_DELIVER;
     },
 
     /**
-     * 锁定送货目标
+     * 锁定送货目标（支持多个搬运者同时锁定）
      */
     _lockDeliver: function (id, creepName) {
         if (!Memory._transporterLocks) Memory._transporterLocks = { pickups: {}, delivers: {} };
-        Memory._transporterLocks.delivers[id] = creepName;
+        
+        if (!Memory._transporterLocks.delivers[id]) {
+            Memory._transporterLocks.delivers[id] = [];
+        }
+        
+        var locks = Memory._transporterLocks.delivers[id];
+        // 兼容旧格式（字符串）→ 转换为数组
+        if (typeof locks === 'string') {
+            locks = [locks];
+            Memory._transporterLocks.delivers[id] = locks;
+        }
+        
+        // 避免重复锁定
+        if (locks.indexOf(creepName) === -1) {
+            locks.push(creepName);
+        }
+        
+        if (!Memory._transporterLockTimestamps) Memory._transporterLockTimestamps = {};
+        Memory._transporterLockTimestamps[id] = Game.time;
     },
 
     /**
-     * 释放 creep 持有的所有锁
+     * 释放 creep 持有的所有锁（支持数组格式送货锁）
      */
     _releaseAllLocks: function (creepName) {
         if (!Memory._transporterLocks) return;
         var locks = Memory._transporterLocks;
+        
+        // 取货锁（保持单锁格式）
         for (var key in locks.pickups) {
-            if (locks.pickups[key] === creepName) delete locks.pickups[key];
+            if (locks.pickups[key] === creepName) {
+                delete locks.pickups[key];
+                if (Memory._transporterLockTimestamps) {
+                    delete Memory._transporterLockTimestamps[key];
+                }
+            }
         }
+        
+        // 送货锁（支持数组格式）
         for (var key in locks.delivers) {
-            if (locks.delivers[key] === creepName) delete locks.delivers[key];
+            var deliverLocks = locks.delivers[key];
+            
+            // 兼容旧格式（字符串）
+            if (typeof deliverLocks === 'string') {
+                if (deliverLocks === creepName) {
+                    delete locks.delivers[key];
+                    if (Memory._transporterLockTimestamps) {
+                        delete Memory._transporterLockTimestamps[key];
+                    }
+                }
+                continue;
+            }
+            
+            var idx = deliverLocks.indexOf(creepName);
+            if (idx !== -1) {
+                deliverLocks.splice(idx, 1);
+                if (deliverLocks.length === 0) {
+                    delete locks.delivers[key];
+                    if (Memory._transporterLockTimestamps) {
+                        delete Memory._transporterLockTimestamps[key];
+                    }
+                }
+            }
         }
+    },
+
+    /**
+     * 释放取货锁
+     */
+    _releasePickupLock: function (id, creepName) {
+        if (!Memory._transporterLocks) return;
+        if (Memory._transporterLocks.pickups[id] === creepName) {
+            delete Memory._transporterLocks.pickups[id];
+            if (Memory._transporterLockTimestamps) {
+                delete Memory._transporterLockTimestamps[id];
+            }
+        }
+    },
+
+    /**
+     * 释放送货锁（支持数组格式）
+     */
+    _releaseDeliverLock: function (id, creepName) {
+        if (!Memory._transporterLocks) return;
+        
+        var locks = Memory._transporterLocks.delivers[id];
+        if (!locks) return;
+        
+        // 兼容旧格式（字符串）
+        if (typeof locks === 'string') {
+            if (locks === creepName) {
+                delete Memory._transporterLocks.delivers[id];
+                if (Memory._transporterLockTimestamps) {
+                    delete Memory._transporterLockTimestamps[id];
+                }
+            }
+            return;
+        }
+        
+        var idx = locks.indexOf(creepName);
+        if (idx !== -1) {
+            locks.splice(idx, 1);
+            if (locks.length === 0) {
+                delete Memory._transporterLocks.delivers[id];
+                if (Memory._transporterLockTimestamps) {
+                    delete Memory._transporterLockTimestamps[id];
+                }
+            }
+        }
+    },
+
+    /**
+     * 从目标位置移开一格（处理站在目标上无法寻路的情况）
+     */
+    _moveAwayFromTarget: function (creep, target) {
+        var directions = [TOP, TOP_RIGHT, RIGHT, BOTTOM_RIGHT, BOTTOM, BOTTOM_LEFT, LEFT, TOP_LEFT];
+        for (var i = 0; i < directions.length; i++) {
+            var dx = 0, dy = 0;
+            switch (directions[i]) {
+                case TOP:          dy = -1; break;
+                case TOP_RIGHT:    dx = 1; dy = -1; break;
+                case RIGHT:        dx = 1; break;
+                case BOTTOM_RIGHT: dx = 1; dy = 1; break;
+                case BOTTOM:       dy = 1; break;
+                case BOTTOM_LEFT:  dx = -1; dy = 1; break;
+                case LEFT:         dx = -1; break;
+                case TOP_LEFT:     dx = -1; dy = -1; break;
+            }
+            var newX = creep.pos.x + dx;
+            var newY = creep.pos.y + dy;
+            if (newX >= 0 && newX < 50 && newY >= 0 && newY < 50) {
+                var terrain = creep.room.getTerrain().get(newX, newY);
+                if (terrain !== TERRAIN_MASK_WALL) {
+                    var hasCreep = false;
+                    var creepsAtPos = creep.room.find(FIND_CREEPS, {
+                        filter: function(c) {
+                            return c.pos.x === newX && c.pos.y === newY && c.name !== creep.name;
+                        }
+                    });
+                    if (creepsAtPos.length === 0) {
+                        creep.move(directions[i]);
+                        return;
+                    }
+                }
+            }
+        }
+        // 如果所有方向都被堵住，尝试随机移动
+        creep.move(Math.floor(Math.random() * 8) + 1);
     },
 
     // ══════════════════════════════════════════════════════

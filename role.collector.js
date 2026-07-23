@@ -15,6 +15,7 @@
  */
 
 var taskScheduler = require('task.scheduler');
+var sourceCache   = require('cache.sources');
 
 // ── 内部常量 ────────────────────────────────────────────
 var LOG_LEVEL = {
@@ -26,7 +27,7 @@ var LOG_LEVEL = {
 var CURRENT_LOG_LEVEL = LOG_LEVEL.INFO;
 
 /** 每 source 最大采集者数 */
-var MAX_COLLECTORS_PER_SOURCE = 2;
+var MAX_COLLECTORS_PER_SOURCE = 3;
 
 /** 采集者健康检查：超过此 tick 数无进展视为卡住 */
 var STUCK_THRESHOLD = 50;
@@ -34,8 +35,14 @@ var STUCK_THRESHOLD = 50;
 /** 重试退避基础间隔 (ticks) */
 var RETRY_BASE_INTERVAL = 5;
 
+/** 连续无法到达同一能量源的最大次数，超过则切换 */
+var MAX_SOURCE_FAIL_COUNT = 3;
+
 /** Room.find 缓存有效期 (ticks) */
 var CACHE_TTL = 20;
+
+/** 投放 Container 的最大距离(超过此距离的 Container 不予考虑,直接掉落地上) */
+var DROP_MAX_DISTANCE = 3;
 
 // ── Room 级缓存 ─────────────────────────────────────────
 var _cache = {
@@ -49,6 +56,11 @@ var roleCollector = {
     run: function (creep) {
         // ── 日志上下文 ──
         var logCtx = '[' + creep.name + ']';
+
+        // ── 让位检查(被其他 collector 请求让位时优先执行) ──
+        if (taskScheduler.checkYield(creep)) {
+            return;
+        }
 
         // ── 健康检查：检测是否卡住 ──
         if (this._healthCheck(creep, logCtx)) {
@@ -108,11 +120,49 @@ var roleCollector = {
             });
             // 只有路径不可达才算真正的移动失败
             if (moveResult === ERR_NO_PATH) {
-                this._log(LOG_LEVEL.WARN, logCtx + ' 无法到达能量源 ' + source.id);
-                creep.memory.assignedSourceId = null; // 换一个 source
+                // 记录该 source 的失败次数
+                if (!creep.memory._sourceFailCounts) {
+                    creep.memory._sourceFailCounts = {};
+                }
+                var failCount = (creep.memory._sourceFailCounts[source.id] || 0) + 1;
+                creep.memory._sourceFailCounts[source.id] = failCount;
+
+                if (failCount >= MAX_SOURCE_FAIL_COUNT) {
+                    this._log(LOG_LEVEL.WARN, logCtx + ' 连续 ' + failCount + ' 次无法到达能量源 ' + source.id + '，尝试驱离/调整站位');
+
+                    // 先尝试驱离非采集者或调整站位
+                    var yielded = taskScheduler.requestYield(creep, source);
+                    if (yielded) {
+                        // 已发出让位指令,清空失败计数,下一 tick 重新尝试到达
+                        delete creep.memory._sourceFailCounts[source.id];
+                        this._updateHealth(creep); // 视为有进展,避免误触发卡住恢复
+                        return;
+                    }
+
+                    // 附近无可让位者 → fallback 到原有换矿+冷却逻辑
+                    this._log(LOG_LEVEL.WARN, logCtx + ' 附近无可让位单位,切换能量源');
+                    creep.memory.assignedSourceId = null; // 换一个 source
+                    // 标记该 source 为暂时不可用（冷却 100 ticks）
+                    if (!creep.memory._sourceCooldowns) {
+                        creep.memory._sourceCooldowns = {};
+                    }
+                    creep.memory._sourceCooldowns[source.id] = Game.time + 100;
+                } else {
+                    this._log(LOG_LEVEL.WARN, logCtx + ' 无法到达能量源 ' + source.id + '（第 ' + failCount + ' 次）');
+                }
+            } else {
+                // 移动成功或进行中，重置当前 source 的失败计数
+                if (creep.memory._sourceFailCounts && creep.memory._sourceFailCounts[source.id]) {
+                    delete creep.memory._sourceFailCounts[source.id];
+                }
             }
             this._updateHealth(creep); // 尝试移动 = 有进展
             return;
+        }
+
+        // 成功到达 source，重置失败计数
+        if (creep.memory._sourceFailCounts && creep.memory._sourceFailCounts[source.id]) {
+            delete creep.memory._sourceFailCounts[source.id];
         }
 
         var result = creep.harvest(source);
@@ -169,13 +219,18 @@ var roleCollector = {
                 });
 
             } else if (result === ERR_FULL) {
-                // Container 满了 → 尝试下一个
+                // Container 满了 → 标记并尝试范围内的下一个
                 this._markContainerFull(container.id, logCtx);
-                // 本 tick 重新找
+                // 本 tick 重新找(范围内)
                 var next = this._findNearestContainer(creep);
                 if (!next) {
-                    // 所有 container 都满了，能量也不够一次运输 → 继续采集
-                    creep.memory.collectorState = 'harvesting';
+                    // 范围内 container 都满了 → 直接掉落地上,不去远处
+                    creep.drop(RESOURCE_ENERGY);
+                    this._log(LOG_LEVEL.DEBUG, logCtx + ' 范围内 Container 已满，能量丢在地上 (剩余: ' + creep.store[RESOURCE_ENERGY] + ')');
+                    if (creep.store[RESOURCE_ENERGY] === 0) {
+                        creep.memory.collectorState = 'harvesting';
+                    }
+                    this._updateHealth(creep);
                 }
                 // 否则下一 tick findNearestContainer 会跳过已标记的
 
@@ -184,10 +239,10 @@ var roleCollector = {
                 this._updateHealth(creep); // transfer 失败通常不是致命问题
             }
         } else {
-            // 无可用 Container → 直接丢在地上，等 transporter 来取
-            // 这是早期没有 Container 时的标准做法（drop mining）
+            // 范围内无可用 Container → 直接丢在地上，等 transporter 来取
+            // 这是早期没有 Container 或附近 Container 都满时的标准做法（drop mining）
             creep.drop(RESOURCE_ENERGY);
-            this._log(LOG_LEVEL.DEBUG, logCtx + ' 无 Container，能量丢在地上 (剩余: ' + creep.store[RESOURCE_ENERGY] + ')');
+            this._log(LOG_LEVEL.DEBUG, logCtx + ' 范围内无可用 Container，能量丢在地上 (剩余: ' + creep.store[RESOURCE_ENERGY] + ')');
             // 能量还在身上（drop 只丢了一部分）就继续循环
             if (creep.store[RESOURCE_ENERGY] > 0) {
                 // 下一 tick 继续 drop
@@ -204,52 +259,68 @@ var roleCollector = {
 
     /**
      * 获取分配给该 creep 的能量源
-     * 使用 hash 分配保证每个 creep 固定绑定到一个 source
+     * 优先分配近矿点，固定绑定采集者到矿点
      */
     _getAssignedSource: function (creep) {
-        var sources = this._getCachedSources(creep.room);
+        var sources = sourceCache.getSourcesBySpawnDistance(creep.room);
         if (!sources || sources.length === 0) return null;
 
-        // 如果已有分配，直接返回
+        // 清理已过期的冷却记录
+        if (creep.memory._sourceCooldowns) {
+            for (var sid in creep.memory._sourceCooldowns) {
+                if (Game.time >= creep.memory._sourceCooldowns[sid]) {
+                    delete creep.memory._sourceCooldowns[sid];
+                }
+            }
+        }
+
+        // 已有分配且矿点未满 → 保持绑定
         if (creep.memory.assignedSourceId) {
             var existing = Game.getObjectById(creep.memory.assignedSourceId);
             if (existing) {
-                // 检查该 source 是否超载
-                if (this._countCollectorsAtSource(creep.memory.assignedSourceId) <= MAX_COLLECTORS_PER_SOURCE) {
+                if (creep.memory._sourceCooldowns && creep.memory._sourceCooldowns[creep.memory.assignedSourceId]) {
+                    this._log(LOG_LEVEL.DEBUG,
+                        '[' + creep.name + '] source ' + creep.memory.assignedSourceId + ' 冷却中，重新分配');
+                } else if (this._countCollectorsAtSource(creep.memory.assignedSourceId) <= MAX_COLLECTORS_PER_SOURCE) {
                     return existing;
                 }
-                // 超载了，重新分配
                 this._log(LOG_LEVEL.DEBUG,
-                    '[' + creep.name + '] source ' + creep.memory.assignedSourceId + ' 超载，重新分配');
+                    '[' + creep.name + '] source ' + creep.memory.assignedSourceId + ' 不可用，重新分配');
             }
         }
 
-        // 智能分配：选当前采集者最少的 source
-        var bestSource = null;
-        var minCount = Infinity;
-
+        // 重新分配：按距离从近到远（sources 已按 spawn 距离升序），
+        // 选第一个未满载的矿点，确保近矿优先占用。
+        var assigned = null;
         for (var i = 0; i < sources.length; i++) {
-            var count = this._countCollectorsAtSource(sources[i].id);
-            if (count < minCount) {
-                minCount = count;
-                bestSource = sources[i];
+            var src = sources[i];
+            if (creep.memory._sourceCooldowns && creep.memory._sourceCooldowns[src.id]) {
+                continue;
+            }
+            var cnt = this._countCollectorsAtSource(src.id);
+            if (cnt < MAX_COLLECTORS_PER_SOURCE) {
+                assigned = src;
+                break;
             }
         }
 
-        if (bestSource && minCount < MAX_COLLECTORS_PER_SOURCE) {
-            creep.memory.assignedSourceId = bestSource.id;
-            return bestSource;
+        // 所有矿都满载时的兜底：回到距离最近且未冷却的矿
+        if (!assigned) {
+            for (var j = 0; j < sources.length; j++) {
+                if (creep.memory._sourceCooldowns && creep.memory._sourceCooldowns[sources[j].id]) {
+                    continue;
+                }
+                assigned = sources[j];
+                break;
+            }
         }
 
-        // 所有 source 都已满载 → 使用 hash 分配兜底
-        var hash = 0;
-        for (var j = 0; j < creep.name.length; j++) {
-            hash = ((hash << 5) - hash) + creep.name.charCodeAt(j);
-            hash |= 0;
+        if (assigned) {
+            creep.memory.assignedSourceId = assigned.id;
+            return assigned;
         }
-        var idx = Math.abs(hash) % sources.length;
-        creep.memory.assignedSourceId = sources[idx].id;
-        return sources[idx];
+
+        return sources[0];
     },
 
     /**
@@ -304,7 +375,7 @@ var roleCollector = {
     },
 
     /**
-     * 找最近的可用 Container
+     * 找最近的可用 Container(仅限 DROP_MAX_DISTANCE 范围内)
      */
     _findNearestContainer: function (creep) {
         var containers = this._getCachedContainers(creep.room);
@@ -321,6 +392,10 @@ var roleCollector = {
             if (creep.memory._skipContainer === c.id) continue;
 
             var dist = creep.pos.getRangeTo(c);
+
+            // 超过最大投放距离的 container 不予考虑
+            if (dist > DROP_MAX_DISTANCE) continue;
+
             if (dist < minDist) {
                 minDist = dist;
                 nearest = c;
@@ -427,6 +502,8 @@ var roleCollector = {
             creep.memory.assignedSourceId = null;
             creep.memory._retryCount = 0;
             creep.memory._retryUntil = null;
+            creep.memory._sourceFailCounts = null;
+            creep.memory._sourceCooldowns = null;
 
             return true;
         }

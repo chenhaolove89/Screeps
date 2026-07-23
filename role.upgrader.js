@@ -1,10 +1,19 @@
-var state       = require('state');
-var sourceCache = require('cache.sources');
+var state        = require('state');
+var sourceCache  = require('cache.sources');
+var taskScheduler = require('task.scheduler');
+
+/** 离开 Spawn 的距离（避免停在 Spawn 周围挡住搬运者） */
+var SPAWN_CLEAR_DISTANCE = 5;
 
 var roleUpgrader = {
 
     /** @param {Creep} creep **/
     run: function (creep) {
+        // ── 让位检查(被采集者请求让位时优先执行) ──
+        if (taskScheduler.checkYield(creep)) {
+            return;
+        }
+
         // 如果能量不足，切回采集模式（升级消耗 1 能量/tick/WORK 部件）
         if (creep.memory.upgrading && creep.store[RESOURCE_ENERGY] < 1) {
             creep.memory.upgrading = false;
@@ -21,6 +30,7 @@ var roleUpgrader = {
             // 角色短缺时暂停升级，优先保证孵化
             if (state.creepShortage) {
                 creep.say('⏸ 缺人');
+                this._moveAwayFromSpawn(creep);
                 return;
             }
             var ugResult = creep.upgradeController(creep.room.controller);
@@ -32,19 +42,19 @@ var roleUpgrader = {
                 creep.say('🔄 缺能');
             }
         }
-        // 装能量模式：从 Spawn/Extension/Container 获取能量
+        // 装能量模式：从 Container/Spawn/Extension 获取能量
         else {
             var structures = creep.room.find(FIND_STRUCTURES, {
                 filter: (structure) => {
-                    return (structure.structureType == STRUCTURE_SPAWN ||
-                            structure.structureType == STRUCTURE_EXTENSION) &&
+                    return structure.structureType == STRUCTURE_CONTAINER &&
                         structure.store[RESOURCE_ENERGY] > 0;
                 }
             });
             if (structures.length == 0) {
                 structures = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
-                        return structure.structureType == STRUCTURE_CONTAINER &&
+                        return (structure.structureType == STRUCTURE_SPAWN ||
+                                structure.structureType == STRUCTURE_EXTENSION) &&
                             structure.store[RESOURCE_ENERGY] > 0;
                     }
                 });
@@ -67,6 +77,40 @@ var roleUpgrader = {
                 sourceCache.harvestNearest(creep);
             }
         }
+    },
+
+    /**
+     * 远离 Spawn，避免挡路
+     * 搬运者需要频繁进出 Spawn 区域收集/投放能量
+     */
+    _moveAwayFromSpawn: function (creep) {
+        var spawn = creep.room.find(FIND_STRUCTURES, {
+            filter: (s) => s.structureType == STRUCTURE_SPAWN
+        })[0];
+        if (!spawn) return;
+
+        if (creep.pos.getRangeTo(spawn) >= SPAWN_CLEAR_DISTANCE) {
+            return; // 已经在安全距离之外
+        }
+
+        // 选一个远离 Spawn 的方向（Creep 当前位置的反方向）
+        var dx = creep.pos.x - spawn.pos.x;
+        var dy = creep.pos.y - spawn.pos.y;
+        var distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance === 0) distance = 1;
+
+        var offsetX = Math.round((dx / distance) * SPAWN_CLEAR_DISTANCE);
+        var offsetY = Math.round((dy / distance) * SPAWN_CLEAR_DISTANCE);
+        var targetX = creep.pos.x + offsetX;
+        var targetY = creep.pos.y + offsetY;
+
+        // 边界保护
+        targetX = Math.max(1, Math.min(48, targetX));
+        targetY = Math.max(1, Math.min(48, targetY));
+
+        creep.moveTo(targetX, targetY, {
+            visualizePathStyle: { stroke: '#888888', lineStyle: 'dotted' }
+        });
     }
 };
 

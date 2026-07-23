@@ -47,6 +47,15 @@ var taskScheduler = {
     /** 最大并发活跃任务数 */
     MAX_ACTIVE_TASKS: 50,
 
+    /** 让位持续时间(tick) */
+    YIELD_TICKS: 5,
+
+    /** 让位目标距 source 的最小距离 */
+    YIELD_DISTANCE: 3,
+
+    /** 非采集者角色集合(可被驱离) */
+    YIELDABLE_ROLES: ['transporter', 'upgrader', 'builder', 'repairer'],
+
     // ══════════════════════════════════════════════════════
     //  初始化
     // ══════════════════════════════════════════════════════
@@ -404,6 +413,116 @@ var taskScheduler = {
                 this._log('RELEASE', id + ' ← ' + creepName);
             }
         }
+    },
+
+    // ══════════════════════════════════════════════════════
+    //  让位协调（驱离非采集者 / 调整采集者站位）
+    // ══════════════════════════════════════════════════════
+
+    /**
+     * 请求 source 附近的 creep 让位
+     * 优先驱离非采集者;其次调整采集者站位
+     * @param {Creep} requester - 发起让位请求的 creep
+     * @param {Source} source   - 目标 source
+     * @returns {boolean} true=已发出让位指令
+     */
+    requestYield: function (requester, source) {
+        var nearby = source.pos.findInRange(FIND_CREEPS, 1);
+        var target = null;
+
+        // 第一优先级:非采集者(transporter/upgrader/builder/repairer)
+        for (var i = 0; i < nearby.length; i++) {
+            var c = nearby[i];
+            if (c.name === requester.name) continue;
+            if (this.YIELDABLE_ROLES.indexOf(c.memory.role) !== -1) {
+                target = c;
+                break;
+            }
+        }
+
+        // 第二优先级:其他 collector(调整站位)
+        if (!target) {
+            for (var j = 0; j < nearby.length; j++) {
+                var cc = nearby[j];
+                if (cc.name === requester.name) continue;
+                if (cc.memory.role === 'collector') {
+                    target = cc;
+                    break;
+                }
+            }
+        }
+
+        if (!target) return false;
+
+        // 计算让位目标点(source 周围 YIELD_DISTANCE 格外的空地)
+        var yieldPos = this._findYieldPosition(source);
+        if (!yieldPos) return false;
+
+        target.memory._yieldUntil    = Game.time + this.YIELD_TICKS;
+        target.memory._yieldSourceId = source.id;
+        target.memory._yieldTarget   = yieldPos;
+        this._log('YIELD', target.name + ' 让位给 ' + requester.name + ' @ source ' + source.id);
+        return true;
+    },
+
+    /**
+     * 在 source 附近 YIELD_DISTANCE 格外找一个空地作为让位目标
+     * @param {Source} source
+     * @returns {{x:number,y:number,roomName:string}|null}
+     */
+    _findYieldPosition: function (source) {
+        // 由近到远遍历 source 周围外圈,选第一个非墙非 creep 的格子
+        for (var r = this.YIELD_DISTANCE; r <= this.YIELD_DISTANCE + 2; r++) {
+            for (var dx = -r; dx <= r; dx++) {
+                for (var dy = -r; dy <= r; dy++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue; // 只看外圈
+                    var x = source.pos.x + dx;
+                    var y = source.pos.y + dy;
+                    if (x < 1 || y < 1 || x > 49 || y > 49) continue;
+                    var look = source.room.lookAt(x, y);
+                    var blocked = false;
+                    for (var k = 0; k < look.length; k++) {
+                        if (look[k].type === 'terrain' && look[k].terrain === 'wall') { blocked = true; break; }
+                        if (look[k].type === 'creep') { blocked = true; break; }
+                    }
+                    if (!blocked) {
+                        return { x: x, y: y, roomName: source.pos.roomName };
+                    }
+                }
+            }
+        }
+        return null;
+    },
+
+    /**
+     * 检查 creep 是否处于让位状态,若是则执行让位移动
+     * 各角色 run() 入口调用,返回 true 时本 tick 跳过正常逻辑
+     * @param {Creep} creep
+     * @returns {boolean}
+     */
+    checkYield: function (creep) {
+        if (!creep.memory._yieldUntil) return false;
+
+        // 让位已过期 → 清理
+        if (Game.time >= creep.memory._yieldUntil) {
+            delete creep.memory._yieldUntil;
+            delete creep.memory._yieldSourceId;
+            delete creep.memory._yieldTarget;
+            return false;
+        }
+
+        // 仍在让位期 → 移动到让位目标
+        var target = creep.memory._yieldTarget;
+        if (target) {
+            var pos = new RoomPosition(target.x, target.y, target.roomName);
+            if (!creep.pos.isEqualTo(pos)) {
+                creep.moveTo(pos, {
+                    visualizePathStyle: { stroke: '#ff4444', lineStyle: 'dashed' },
+                    reusePath: 1,
+                });
+            }
+        }
+        return true;
     },
 
     // ══════════════════════════════════════════════════════
