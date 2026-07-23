@@ -9,8 +9,8 @@ module.exports = {
         harvester:  0,
         collector:  6,
         transporter: 5,
-        upgrader:   4,
-        builder:    3,
+        upgrader:   6,
+        builder:    5,
         repairer:   1,
     },
 

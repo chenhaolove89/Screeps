@@ -204,20 +204,25 @@ var roleTransporter = {
             return;
         }
 
-        // 检查是否站在其他结构上（如 Container），需要先移开
+        // 检查是否站在阻挡型结构上(如 Container/Spawn)需要先移开;
+        // 注意:road/rampart 不阻挡移动,creep 站在上面是正常的,不要移开,
+        // 否则会"站在road→移开→moveTo走回road→又移开"循环抖动
         var structuresAtPos = creep.room.lookForAt(LOOK_STRUCTURES, creep.pos);
-        if (structuresAtPos.length > 0) {
-            var isOnTarget = false;
-            for (var j = 0; j < structuresAtPos.length; j++) {
-                if (structuresAtPos[j].id === target.id) {
-                    isOnTarget = true;
-                    break;
-                }
+        var hasBlockingStructure = false;
+        var isOnTarget = false;
+        for (var j = 0; j < structuresAtPos.length; j++) {
+            if (structuresAtPos[j].id === target.id) {
+                isOnTarget = true;
+                break;
             }
-            if (!isOnTarget) {
-                this._moveAwayFromTarget(creep, target);
-                return;
+            var stType = structuresAtPos[j].structureType;
+            if (stType !== STRUCTURE_ROAD && stType !== STRUCTURE_RAMPART) {
+                hasBlockingStructure = true;
             }
+        }
+        if (!isOnTarget && hasBlockingStructure) {
+            this._moveAwayFromTarget(creep, target);
+            return;
         }
 
         var moveResult = creep.moveTo(target, {
@@ -284,6 +289,7 @@ var roleTransporter = {
             if (creep.store.getFreeCapacity() === 0) {
                 creep.memory._transportPhase = 'carry';
                 creep.memory.transporterState = 'DELIVERING';
+                creep.say('📦 送货');
                 this._doDelivery(creep, logCtx);
             } else {
                 // 未满,继续在 empty 阶段,下一 tick 重新选最近取货点
@@ -328,11 +334,20 @@ var roleTransporter = {
                 creep.memory._taskId = null;
                 creep.memory._deliverId = null;
             }
-            creep.memory.transporterState = 'GET_TASK';
-            creep.memory._transportPhase = 'empty';
+            // 身上还有能量 → 保持 carry 阶段等待下一 tick 重试,
+            // 不要切 empty(否则会"找取货点→走到Container→满→找送货→无目标→切empty→..."
+            //  在 Container↔原位 之间循环抖动)
+            creep.memory.transporterState = 'DELIVERING';
+            // 防止每 tick say 刷屏:只在首次进入"无目标"时喊一次
+            if (!creep.memory._saidNoTarget) {
+                creep.say('⏸ 无目标');
+                creep.memory._saidNoTarget = true;
+            }
             return;
         }
 
+        // 找到目标 → 清除"无目标"标记
+        creep.memory._saidNoTarget = false;
         creep.memory._deliverId = target.id;
         creep.memory.transporterState = 'MOVING_TO_DELIVER';
         this._moveToDeliver(creep, logCtx);
@@ -368,20 +383,25 @@ var roleTransporter = {
             return;
         }
 
-        // 检查是否站在结构上（如 Container），需要先移开
+        // 检查是否站在阻挡型结构上(如 Container/Spawn)需要先移开;
+        // 注意:road/rampart 不阻挡移动,creep 站在上面是正常的,不要移开,
+        // 否则会"站在road→移开→moveTo走回road→又移开"循环抖动
         var structuresAtPos = creep.room.lookForAt(LOOK_STRUCTURES, creep.pos);
-        if (structuresAtPos.length > 0) {
-            var isOnTarget = false;
-            for (var j = 0; j < structuresAtPos.length; j++) {
-                if (structuresAtPos[j].id === target.id) {
-                    isOnTarget = true;
-                    break;
-                }
+        var hasBlockingStructure = false;
+        var isOnTarget = false;
+        for (var j = 0; j < structuresAtPos.length; j++) {
+            if (structuresAtPos[j].id === target.id) {
+                isOnTarget = true;
+                break;
             }
-            if (!isOnTarget) {
-                this._moveAwayFromTarget(creep, target);
-                return;
+            var stType = structuresAtPos[j].structureType;
+            if (stType !== STRUCTURE_ROAD && stType !== STRUCTURE_RAMPART) {
+                hasBlockingStructure = true;
             }
+        }
+        if (!isOnTarget && hasBlockingStructure) {
+            this._moveAwayFromTarget(creep, target);
+            return;
         }
 
         var moveResult = creep.moveTo(target, {
@@ -869,6 +889,7 @@ var roleTransporter = {
             creep.memory._deliverId = null;
             creep.memory.transporterState = 'GET_TASK';
             creep.memory._transportPhase = 'empty';
+            creep.say('🔄 取货');
 
             // 释放锁
             this._releaseAllLocks(creep.name);
@@ -945,6 +966,7 @@ var roleTransporter = {
             this._log(LOG_LEVEL.WARN, logCtx + ' 停滞检测：强制重置状态');
             creep.memory._transportPhase = 'empty';
             creep.memory.transporterState = 'GET_TASK';
+            creep.say('🔄 重置');
             creep.memory._pickupId = null;
             creep.memory._deliverId = null;
             creep.memory._taskId = null;

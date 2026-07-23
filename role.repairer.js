@@ -51,13 +51,15 @@ var roleRepairer = {
         }
         // 采集模式
         else {
-            // 优先从 Container 取能量
+            // 优先从最近的 Container 取能量
             var structures = creep.room.find(FIND_STRUCTURES, {
                 filter: (structure) => {
                     return structure.structureType == STRUCTURE_CONTAINER &&
                         structure.store[RESOURCE_ENERGY] > 0;
                 }
             });
+            // 按距离排序，优先去最近的 Container
+            structures.sort((a, b) => creep.pos.getRangeTo(a) - creep.pos.getRangeTo(b));
             if (structures.length == 0) {
                 // 从 Spawn/Extension 取
                 structures = creep.room.find(FIND_STRUCTURES, {

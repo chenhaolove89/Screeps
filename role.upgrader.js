@@ -50,6 +50,8 @@ var roleUpgrader = {
                         structure.store[RESOURCE_ENERGY] > 0;
                 }
             });
+            // 按距离排序，优先去最近的 Container
+            structures.sort((a, b) => creep.pos.getRangeTo(a) - creep.pos.getRangeTo(b));
             if (structures.length == 0) {
                 structures = creep.room.find(FIND_STRUCTURES, {
                     filter: (structure) => {
