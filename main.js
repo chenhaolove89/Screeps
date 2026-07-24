@@ -5,6 +5,7 @@ var roleUpgrader    = require('role.upgrader');
 var roleBuilder     = require('role.builder');
 var roleRepairer    = require('role.repairer');
 var managerSpawn    = require('manager.spawn');
+var managerTower    = require('manager.tower');
 var state           = require('state');
 var creepCache      = require('cache.creep');
 
@@ -26,21 +27,7 @@ module.exports.loop = function () {
     }
 
     // ── 防御塔 ──
-    var towers = _.filter(Game.structures, s => s.structureType == STRUCTURE_TOWER);
-    for (var i = 0; i < towers.length; i++) {
-        var tower = towers[i];
-        var hostile = tower.pos.findClosestByRange(FIND_HOSTILE_CREEPS);
-        if (hostile) {
-            tower.attack(hostile);
-        } else {
-            var damaged = tower.pos.findClosestByRange(FIND_STRUCTURES, {
-                filter: s => s.hits < s.hitsMax
-                    && s.structureType != STRUCTURE_WALL
-                    && s.structureType != STRUCTURE_RAMPART
-            });
-            if (damaged) tower.repair(damaged);
-        }
-    }
+    managerTower.run();
 
     // ── 清理死亡 Creep 内存 + 同步缓存 ──
     for (var name in Memory.creeps) {
