@@ -29,14 +29,29 @@ var state = {
     /** @type {Object.<string, {x: number, y: number, roomName: string}>} 矿点坐标缓存 */
     sourceData: {},
 
-    /** @type {Object.<string, boolean>} 每 tick 矿点是否有空闲相邻格的缓存（key: sourceId, value: true=有空位） */
-    sourceSlotFree: {},
-
     /** @type {Object.<string, number>} 每 tick 矿点空闲相邻格数量的缓存（key: sourceId, value: 空闲格子数） */
     sourceSlotCount: {},
 
     /** @type {Object.<string, number>} 矿点到 Spawn 的距离缓存（key: sourceId, value: 距离） */
     sourceSpawnDist: {},
+
+    // ── Spawn 与房间缓存 ──────────────────────────────────
+
+    /** @type {string|null} 当前主 spawn 名称（动态发现，不再硬编码 Spawn1） */
+    spawnName: null,
+
+    /** @type {string|null} 当前主 spawn 所在房间名（检测房间变更用） */
+    spawnRoomName: null,
+
+    // ── 建筑缓存 ──────────────────────────────────────────
+
+    /** @type {string[]} Tower ID 缓存（首次 tick 或缓存失效时刷新） */
+    towerIds: [],
+
+    // ── 紧急模式 ──────────────────────────────────────────
+
+    /** @type {boolean} 是否处于紧急模式（基地重启中，以 harvester 为主） */
+    emergencyMode: false,
 };
 
 module.exports = state;

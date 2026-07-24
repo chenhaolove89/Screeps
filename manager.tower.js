@@ -25,6 +25,8 @@ var DEBUG = true;
 
 // ── 模块 ────────────────────────────────────────────────
 
+var state = require('state');
+
 var managerTower = {
 
     /**
@@ -32,10 +34,51 @@ var managerTower = {
      * 遍历房间内所有 Tower，按优先级执行动作
      */
     run: function () {
-        var towers = _.filter(Game.structures, s => s.structureType == STRUCTURE_TOWER);
+        var towers = this._getTowers();
         for (var i = 0; i < towers.length; i++) {
             this._runTower(towers[i]);
         }
+    },
+
+    /**
+     * 获取房间内所有 Tower（带缓存）
+     * 缓存命中时用 Game.getObjectById（O(1) per tower），
+     * 缓存失效或为空时全量扫描刷新
+     */
+    _getTowers: function () {
+        var towers = [];
+        var needRefresh = false;
+
+        // 缓存为空 → 需要扫描（检测新建的 Tower）
+        if (state.towerIds.length === 0) {
+            needRefresh = true;
+        } else {
+            // 验证缓存中的 Tower 是否仍然有效
+            for (var i = 0; i < state.towerIds.length; i++) {
+                var t = Game.getObjectById(state.towerIds[i]);
+                if (t && t.structureType == STRUCTURE_TOWER) {
+                    towers.push(t);
+                } else {
+                    // 某个 Tower 失效（被摧毁）→ 需要重新扫描
+                    needRefresh = true;
+                    break;
+                }
+            }
+        }
+
+        if (needRefresh) {
+            state.towerIds = [];
+            towers = [];
+            for (var id in Game.structures) {
+                var s = Game.structures[id];
+                if (s.structureType == STRUCTURE_TOWER) {
+                    state.towerIds.push(id);
+                    towers.push(s);
+                }
+            }
+        }
+
+        return towers;
     },
 
     /**

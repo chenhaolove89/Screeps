@@ -5,6 +5,7 @@
 var config = require('config');
 var creepCache = require('cache.creep');
 var bodyConfig = require('body.config');
+var state = require('state');
 
 var managerSpawn = {
 
@@ -16,11 +17,17 @@ var managerSpawn = {
         // 如果孵化器正在忙，跳过
         if (spawn.spawning) return;
 
-        var energy = spawn.room.energyAvailable;
-        var targets = config.roleTargets;
+        // 紧急模式检测
+        this._checkEmergency();
 
-        // 基础劳动力充足且能量供应链正常时，等待高能量再孵化
-        if (managerSpawn._canWaitForHighEnergy(spawn, targets)) {
+        var energy = spawn.room.energyAvailable;
+        // 紧急模式用 emergencyRoleTargets，否则用 roleTargets
+        var targets = state.emergencyMode
+            ? config.emergencyRoleTargets
+            : config.roleTargets;
+
+        // 紧急模式不等待高能量，立即孵化
+        if (!state.emergencyMode && managerSpawn._canWaitForHighEnergy(spawn, targets)) {
             var capacity = spawn.room.energyCapacityAvailable;
             var highThreshold = capacity * 0.8;
             if (energy < highThreshold) {
@@ -74,6 +81,29 @@ var managerSpawn = {
             }
         }
         return false;
+    },
+
+    /**
+     * 紧急模式检测
+     * 进入条件：存活 creep 总数低于阈值（基地毁灭后重启）
+     * 退出条件：harvester 达标且 spawn 能量充足
+     */
+    _checkEmergency: function () {
+        var totalCreeps = state.allNames.length;
+        if (state.emergencyMode) {
+            // 退出条件：harvester 达标且 spawn 能量充足
+            var harvesterCount = creepCache.count('harvester');
+            if (harvesterCount >= config.emergencyRoleTargets.harvester) {
+                state.emergencyMode = false;
+                console.log('[Spawn] 退出紧急模式，恢复正常配置');
+            }
+        } else {
+            // 进入条件：creep 总数低于阈值
+            if (totalCreeps <= config.emergencyCreepThreshold) {
+                state.emergencyMode = true;
+                console.log('[Spawn] 进入紧急模式（creep 总数: ' + totalCreeps + '）');
+            }
+        }
     },
 
     /**

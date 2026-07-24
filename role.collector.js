@@ -16,6 +16,7 @@
 
 var taskScheduler = require('task.scheduler');
 var sourceCache   = require('cache.sources');
+var state         = require('state');
 
 // ── 内部常量 ────────────────────────────────────────────
 var LOG_LEVEL = {
@@ -325,19 +326,23 @@ var roleCollector = {
 
     /**
      * 统计某 source 当前被多少个 collector 占用
+     * 使用 state.byRole 缓存避免全量遍历 Game.creeps
      */
     _countCollectorsAtSource: function (sourceId) {
         var count = 0;
-        for (var name in Game.creeps) {
-            var c = Game.creeps[name];
-            if (c.memory.role === 'collector' && c.memory.assignedSourceId === sourceId) {
+        // 遍历 collector 子集（而非全部 creep）
+        var collectors = state.byRole['collector'] || [];
+        for (var i = 0; i < collectors.length; i++) {
+            var c = Game.creeps[collectors[i]];
+            if (c && c.memory.assignedSourceId === sourceId) {
                 count++;
             }
         }
         // 也检查 harvester（向后兼容）
-        for (var name in Game.creeps) {
-            var c = Game.creeps[name];
-            if (c.memory.role === 'harvester' && c.memory.assignedSourceId === sourceId) {
+        var harvesters = state.byRole['harvester'] || [];
+        for (var j = 0; j < harvesters.length; j++) {
+            var h = Game.creeps[harvesters[j]];
+            if (h && h.memory.assignedSourceId === sourceId) {
                 count++;
             }
         }

@@ -63,17 +63,36 @@ var sourceCache = {
 
     /**
      * 返回按到 Spawn 距离排序的矿点列表（近→远）
+     * 缓存失效时（迁移新房间等）自动 fallback 到 room.find 并重建缓存
      * @param {Room} room
      * @returns {Source[]}
      */
     getSourcesBySpawnDistance: function (room) {
         var ids = state.sourceIds;
         var result = [];
+
+        // 从缓存获取 source
         for (var i = 0; i < ids.length; i++) {
             var source = Game.getObjectById(ids[i]);
-            if (!source) continue;
-            result.push(source);
+            if (source) result.push(source);
         }
+
+        // 缓存全部失效（迁移新房间未及时重建）→ 直接查询房间并重建缓存
+        if (result.length === 0) {
+            result = room.find(FIND_SOURCES);
+            if (result.length > 0) {
+                state.sourceIds = [];
+                state.sourceData = {};
+                state.sourceSpawnDist = {};
+                for (var j = 0; j < result.length; j++) {
+                    var s = result[j];
+                    state.sourceIds.push(s.id);
+                    state.sourceData[s.id] = { x: s.pos.x, y: s.pos.y, roomName: s.pos.roomName };
+                }
+                console.log('[SourceCache] 缓存失效，已从 room.find 重建 (' + result.length + ' sources)');
+            }
+        }
+
         result.sort(function (a, b) {
             return this.getSpawnDistance(a) - this.getSpawnDistance(b);
         }.bind(this));

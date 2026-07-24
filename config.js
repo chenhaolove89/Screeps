@@ -14,6 +14,19 @@ module.exports = {
         repairer:   1,
     },
 
+    // 紧急模式角色配置（基地毁灭后重启用，以 harvester 为主不依赖 Container）
+    emergencyRoleTargets: {
+        harvester:  3,
+        collector:  2,
+        transporter: 1,
+        upgrader:   0,
+        builder:    0,
+        repairer:   0,
+    },
+
+    // 紧急模式判定阈值：存活 creep 总数低于此值触发
+    emergencyCreepThreshold: 3,
+
     // 孵化能量门槛（低于此值不孵化）
     spawnEnergyThreshold: 200,
 

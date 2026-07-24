@@ -65,6 +65,12 @@ var COMBAT_BODY_TEMPLATES = {
  * 配比策略:WORK:CARRY:MOVE = 2:1:2 (平衡采集与移动)
  */
 function getHarvesterBody(energy) {
+    // 低能量分支（生存期，避免触发安全回退）
+    if (energy < 350) {
+        var minBody = [WORK, CARRY, MOVE];
+        _log('harvester', energy, minBody, 200);
+        return minBody;
+    }
     // 单元成本:WORK(100) + WORK(100) + CARRY(50) + MOVE(50) + MOVE(50) = 350
     var unitCost = 350;
     var units = Math.max(1, Math.min(Math.floor(energy / unitCost), 4));
@@ -125,6 +131,12 @@ function getTransporterBody(energy) {
  * 配比策略:类似harvester的2:1:2配比
  */
 function getUpgraderBody(energy) {
+    // 低能量分支（生存期，避免触发安全回退）
+    if (energy < 350) {
+        var minBody = [WORK, CARRY, MOVE];
+        _log('upgrader', energy, minBody, 200);
+        return minBody;
+    }
     // 单元成本:WORK(100) * 2 + CARRY(50) + MOVE(50) * 2 = 350
     var unitCost = 350;
     var units = Math.max(1, Math.min(Math.floor(energy / unitCost), 3));

@@ -1,512 +1,546 @@
 /**
- * 统一任务调度框架
+ * 任务调度器 (Task Scheduler)
  *
- * 提供跨角色的任务定义、优先级队列、分配与状态管理。
- * 防止多 creep 竞争同一目标，支持死锁检测、重试管理与统计上报。
+ * 跨角色的统一任务调度框架，状态持久化在 Memory.tasks。
  *
  * ── 设计原则 ──
  * 1. 一个任务同一时刻只分配给一个 creep
- * 2. 资源节点（source / container / dropped）分配采用"先占先得"
+ * 2. 资源节点分配采用「先占先得」
  * 3. 任务有超时机制，超时自动回收
- * 4. 所有状态持久化在 Memory.tasks 中
+ * 4. 所有状态持久化在 Memory.tasks
+ *
+ * ── 核心功能 ──
+ * - 任务优先级队列
+ * - 资源锁（sourceLocks / targetLocks）
+ * - 死锁检测（死 creep 持锁、停滞任务）
+ * - 让位协调（collector 优先级最高，可请求其他角色让位）
+ * - 超时回收与 GC
  */
+
+// ══════════════════════════════════════════════════════
+//  常量
+// ══════════════════════════════════════════════════════
+
+var TASK_TYPES = {
+    TRANSPORT: 'transport',
+    COLLECT:   'collect',
+    BUILD:     'build',
+    REPAIR:    'repair',
+    UPGRADE:   'upgrade',
+};
+
+var STATUS = {
+    PENDING:     'pending',
+    ASSIGNED:    'assigned',
+    IN_PROGRESS: 'in_progress',
+    COMPLETED:   'completed',
+    FAILED:      'failed',
+    TIMED_OUT:   'timed_out',
+};
+
+var PRIORITY = {
+    CRITICAL: 0,
+    HIGH:     1,
+    NORMAL:   2,
+    LOW:      3,
+};
+
+/** 任务超时（ticks） */
+var TASK_TIMEOUT = 300;
+
+/** 已完成任务保留时长（ticks） */
+var TASK_RETENTION = 100;
+
+/** 最大活跃任务数 */
+var MAX_ACTIVE_TASKS = 50;
+
+/** 让位持续 tick 数 */
+var YIELD_TICKS = 5;
+
+/** 让位目标距 source 的最小距离 */
+var YIELD_DISTANCE = 3;
+
+/** 可被驱离的非采集者角色 */
+var YIELDABLE_ROLES = ['transporter', 'upgrader', 'builder', 'repairer'];
+
+// ══════════════════════════════════════════════════════
+//  模块
+// ══════════════════════════════════════════════════════
 
 var taskScheduler = {
 
-    // ── 内置常量 ────────────────────────────────────────
-    TASK_TYPES: {
-        TRANSPORT:  'transport',
-        COLLECT:    'collect',
-        BUILD:      'build',
-        REPAIR:     'repair',
-        UPGRADE:    'upgrade',
-    },
+    // ── 常量导出 ──
+    TASK_TYPES: TASK_TYPES,
+    STATUS:     STATUS,
+    PRIORITY:   PRIORITY,
 
-    STATUS: {
-        PENDING:     'pending',
-        ASSIGNED:    'assigned',
-        IN_PROGRESS: 'in_progress',
-        COMPLETED:   'completed',
-        FAILED:      'failed',
-        TIMED_OUT:   'timed_out',
-    },
+    // ── 可配置参数（供外部读取） ──
+    YIELD_TICKS:      YIELD_TICKS,
+    YIELD_DISTANCE:   YIELD_DISTANCE,
+    YIELDABLE_ROLES:  YIELDABLE_ROLES,
+    TASK_TIMEOUT:     TASK_TIMEOUT,
+    TASK_RETENTION:   TASK_RETENTION,
+    MAX_ACTIVE_TASKS: MAX_ACTIVE_TASKS,
 
-    PRIORITY: {
-        CRITICAL: 0,  // spawn/extension 急需能量
-        HIGH:     1,  // tower 补充弹药
-        NORMAL:   2,  // 常规 transport
-        LOW:      3,  // storage/container 补充
-    },
-
-    /** 任务超时 tick 数（超过则自动回收） */
-    TASK_TIMEOUT: 300,
-
-    /** 已完成/失败任务保留 tick 数（用于统计查询） */
-    TASK_RETENTION: 100,
-
-    /** 最大并发活跃任务数 */
-    MAX_ACTIVE_TASKS: 50,
-
-    /** 让位持续时间(tick) */
-    YIELD_TICKS: 5,
-
-    /** 让位目标距 source 的最小距离 */
-    YIELD_DISTANCE: 3,
-
-    /** 非采集者角色集合(可被驱离) */
-    YIELDABLE_ROLES: ['transporter', 'upgrader', 'builder', 'repairer'],
-
-    // ══════════════════════════════════════════════════════
-    //  初始化
-    // ══════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════
+    //  初始化与 GC
+    // ════════════════════════════════════════════════════
 
     /**
-     * 确保 Memory.tasks 存在并初始化结构
+     * 确保 Memory.tasks 结构存在并执行 GC
+     * 应在 main.js 每 tick 开头调用
      */
     init: function () {
         if (!Memory.tasks) {
             Memory.tasks = {
-                active:     {},   // { taskId: Task }
-                completed:  {},   // 最近完成的任务统计
-                sourceLocks: {},  // { sourceId: assignedCreepName }
-                targetLocks: {},  // { targetId: [taskIds...] }
+                active:        {},   // 活跃任务（pending/assigned/in_progress）
+                completed:     {},   // 已完成任务（待 GC）
+                sourceLocks:   {},   // source 资源锁（sourceId → creepName）
+                targetLocks:   {},   // target 资源锁（targetId → [creepName, ...]）
                 stats: {
-                    totalCreated:  0,
-                    totalCompleted: 0,
-                    totalFailed:    0,
-                    avgDuration:    0,
+                    created:     0,
+                    completed:   0,
+                    failed:      0,
+                    timedOut:    0,
                 },
             };
         }
-        // 每 tick 执行一次垃圾回收
+        if (!Memory.tasks.active)      Memory.tasks.active = {};
+        if (!Memory.tasks.completed)   Memory.tasks.completed = {};
+        if (!Memory.tasks.sourceLocks) Memory.tasks.sourceLocks = {};
+        if (!Memory.tasks.targetLocks) Memory.tasks.targetLocks = {};
+        if (!Memory.tasks.stats)       Memory.tasks.stats = { created: 0, completed: 0, failed: 0, timedOut: 0 };
+
         this._gc();
     },
 
-    // ══════════════════════════════════════════════════════
-    //  任务 CRUD
-    // ══════════════════════════════════════════════════════
+    /**
+     * 垃圾回收：清理过期已完成任务
+     */
+    _gc: function () {
+        var now = Game.time;
+        var completed = Memory.tasks.completed;
+        for (var tid in completed) {
+            var t = completed[tid];
+            if (t.completedAt && now - t.completedAt > TASK_RETENTION) {
+                delete completed[tid];
+            }
+        }
+    },
+
+    // ════════════════════════════════════════════════════
+    //  任务生命周期
+    // ════════════════════════════════════════════════════
 
     /**
-     * 创建一个新任务
-     *
-     * @param {string}  type         - 任务类型
-     * @param {number}  priority     - 优先级 (0=critical, 3=low)
-     * @param {string}  sourceId     - 资源来源 ID（structure id / resource id）
-     * @param {string}  targetId     - 目标 ID
-     * @param {string}  resourceType - 资源类型（默认 RESOURCE_ENERGY）
-     * @param {number}  amount       - 目标运输量（0=全部）
-     * @param {number}  [maxRetries] - 最大重试次数（默认 3）
-     * @returns {string|null} 任务 ID；若队列已满或资源锁冲突返回 null
+     * 创建任务
+     * @param {string} type - TASK_TYPES 之一
+     * @param {number} priority - PRIORITY 之一
+     * @param {string} sourceId - 资源来源 ID
+     * @param {string} targetId - 目标 ID
+     * @param {string} resourceType - 资源类型（如 RESOURCE_ENERGY）
+     * @param {number} amount - 数量
+     * @param {number} [maxRetries=3] - 最大重试次数
+     * @returns {string|null} taskId
      */
     createTask: function (type, priority, sourceId, targetId, resourceType, amount, maxRetries) {
         this.init();
 
-        // 容量检查
-        if (Object.keys(Memory.tasks.active).length >= this.MAX_ACTIVE_TASKS) {
+        // 容量检查：活跃任务过多则拒绝
+        var activeCount = 0;
+        for (var k in Memory.tasks.active) { activeCount++; }
+        if (activeCount >= MAX_ACTIVE_TASKS) {
+            this._log('活跃任务达上限(' + MAX_ACTIVE_TASKS + ')，拒绝创建');
             return null;
         }
 
-        // 去重：检查是否已有相同 source→target 的活跃任务
-        if (this._hasDuplicate(type, sourceId, targetId)) {
-            return null;
+        // 去重：避免相同 source+target+type 的重复任务
+        for (var tid in Memory.tasks.active) {
+            var existing = Memory.tasks.active[tid];
+            if (existing.type === type
+                && existing.sourceId === sourceId
+                && existing.targetId === targetId
+                && existing.status === STATUS.PENDING) {
+                return tid; // 已有相同 pending 任务，复用
+            }
         }
 
-        var taskId = type + '_' + Game.time + '_' + Math.floor(Math.random() * 10000);
-
-        /** @type {Task} */
-        var task = {
-            id:           taskId,
-            type:         type,
-            priority:     priority,
-            sourceId:     sourceId,
-            targetId:     targetId,
-            resourceType: resourceType || RESOURCE_ENERGY,
-            amount:       amount || 0,
-            status:       this.STATUS.PENDING,
-            assignedCreep: null,
-            createdAt:    Game.time,
-            startedAt:    null,
-            completedAt:  null,
-            retryCount:   0,
-            maxRetries:   (maxRetries !== undefined) ? maxRetries : 3,
-            lastError:    null,
-            progress:     { current: 0, total: amount || 0 },
+        var taskId = 'task_' + Game.time + '_' + Math.random().toString(36).substr(2, 6);
+        Memory.tasks.active[taskId] = {
+            id:            taskId,
+            type:          type,
+            priority:      priority,
+            sourceId:      sourceId,
+            targetId:      targetId,
+            resourceType:  resourceType || RESOURCE_ENERGY,
+            amount:        amount,
+            status:        STATUS.PENDING,
+            createdAt:     Game.time,
+            assignedTo:    null,
+            assignedAt:    null,
+            progressCurrent: 0,
+            progressTotal:   amount || 0,
+            retries:       0,
+            maxRetries:    maxRetries != null ? maxRetries : 3,
+            error:         null,
         };
-
-        Memory.tasks.active[taskId] = task;
-        Memory.tasks.stats.totalCreated++;
+        Memory.tasks.stats.created++;
         return taskId;
     },
 
     /**
-     * 获取当前 creep 的下一个最优任务
-     * 按优先级排序，跳过已分配的任务
-     *
+     * 获取 creep 的下一个最优任务（按优先级，跳过已分配/锁冲突）
      * @param {Creep} creep
-     * @returns {Task|null}
+     * @returns {Object|null} 任务对象
      */
     getNextTask: function (creep) {
         this.init();
-        var tasks = Memory.tasks.active;
-        var bestTask = null;
-        var bestPriority = Infinity;
 
-        for (var id in tasks) {
-            var t = tasks[id];
+        var best = null;
+        var bestPriority = PRIORITY.LOW + 1;
 
-            // 只取 pending 状态的任务
-            if (t.status !== this.STATUS.PENDING) continue;
+        for (var tid in Memory.tasks.active) {
+            var t = Memory.tasks.active[tid];
+            if (t.status !== STATUS.PENDING) continue;
+            if (t.priority > bestPriority) continue;
 
-            // 检查资源锁：source 是否已被占用
-            if (this._isSourceLocked(t.sourceId)) continue;
-
-            // 检查目标冲突：同一个 target 是否已有其他任务
-            if (this._hasTargetConflict(t.targetId, creep.name)) continue;
-
-            // 选择优先级最高的
-            if (t.priority < bestPriority) {
-                bestPriority = t.priority;
-                bestTask = t;
+            // 检查 source 锁是否被他人占用
+            if (t.sourceId && Memory.tasks.sourceLocks[t.sourceId]
+                && Memory.tasks.sourceLocks[t.sourceId] !== creep.name) {
+                continue;
             }
+
+            best = t;
+            bestPriority = t.priority;
         }
 
-        return bestTask;
+        return best;
     },
 
     /**
-     * 将任务分配给指定 creep
-     *
+     * 分配任务给 creep，锁住 source
      * @param {string} taskId
      * @param {string} creepName
-     * @returns {boolean}
      */
     assignTask: function (taskId, creepName) {
-        var task = Memory.tasks.active[taskId];
-        if (!task || task.status !== this.STATUS.PENDING) return false;
+        this.init();
+        var t = Memory.tasks.active[taskId];
+        if (!t) return false;
+        if (t.status !== STATUS.PENDING) return false;
+
+        t.status = STATUS.ASSIGNED;
+        t.assignedTo = creepName;
+        t.assignedAt = Game.time;
 
         // 锁住 source
-        Memory.tasks.sourceLocks[task.sourceId] = creepName;
-
-        task.status = this.STATUS.ASSIGNED;
-        task.assignedCreep = creepName;
-        task.startedAt = Game.time;
-
-        this._log('ASSIGN', taskId + ' → ' + creepName + ' [p' + task.priority + ']');
+        if (t.sourceId) {
+            Memory.tasks.sourceLocks[t.sourceId] = creepName;
+        }
         return true;
     },
 
     /**
      * 更新任务进度
-     *
      * @param {string} taskId
-     * @param {string} status - 新状态
+     * @param {string} status - STATUS 之一
      * @param {number} [progressCurrent]
      * @param {number} [progressTotal]
      * @param {string} [error]
      */
     updateTask: function (taskId, status, progressCurrent, progressTotal, error) {
-        var task = Memory.tasks.active[taskId];
-        if (!task) return;
-
-        if (status) task.status = status;
-        if (progressCurrent !== undefined) task.progress.current = progressCurrent;
-        if (progressTotal !== undefined)   task.progress.total   = progressTotal;
-        if (error)                         task.lastError        = error;
-    },
-
-    /**
-     * 完成任务
-     *
-     * @param {string} taskId
-     */
-    completeTask: function (taskId) {
-        var task = Memory.tasks.active[taskId];
-        if (!task) return;
-
-        task.status = this.STATUS.COMPLETED;
-        task.completedAt = Game.time;
-
-        // 释放锁
-        this._releaseLock(task);
-
-        // 移到 completed 区域
-        this._archive(task);
-
-        // 更新统计
-        var stats = Memory.tasks.stats;
-        stats.totalCompleted++;
-        var duration = task.completedAt - task.createdAt;
-        stats.avgDuration = Math.round(
-            (stats.avgDuration * (stats.totalCompleted - 1) + duration) / stats.totalCompleted
-        );
-
-        this._log('DONE', taskId + ' [' + duration + ' ticks]');
-    },
-
-    /**
-     * 标记任务失败（可能触发重试）
-     *
-     * @param {string} taskId
-     * @param {string} error
-     * @returns {boolean} 若已触发重试返回 true
-     */
-    failTask: function (taskId, error) {
-        var task = Memory.tasks.active[taskId];
-        if (!task) return false;
-
-        task.lastError = error;
-        task.retryCount++;
-
-        if (task.retryCount <= task.maxRetries) {
-            // 重试：重置为 pending
-            task.status = this.STATUS.PENDING;
-            task.assignedCreep = null;
-            task.startedAt = null;
-            this._releaseLock(task);
-            this._log('RETRY', taskId + ' (' + task.retryCount + '/' + task.maxRetries + ') ' + error);
-            return true;
-        }
-
-        // 重试耗尽
-        task.status = this.STATUS.FAILED;
-        task.completedAt = Game.time;
-        this._releaseLock(task);
-        this._archive(task);
-
-        Memory.tasks.stats.totalFailed++;
-        this._log('FAIL', taskId + ' ' + error);
-        return false;
-    },
-
-    /**
-     * 检查并回收超时任务
-     */
-    checkTimeouts: function () {
-        var tasks = Memory.tasks.active;
-        var now = Game.time;
-
-        for (var id in tasks) {
-            var t = tasks[id];
-            if (
-                (t.status === this.STATUS.ASSIGNED || t.status === this.STATUS.IN_PROGRESS) &&
-                t.startedAt &&
-                now - t.startedAt > this.TASK_TIMEOUT
-            ) {
-                t.status = this.STATUS.TIMED_OUT;
-                this._releaseLock(t);
-                this._archive(t);
-                this._log('TIMEOUT', id + ' (assigned to ' + t.assignedCreep + ')');
-            }
-        }
-    },
-
-    // ══════════════════════════════════════════════════════
-    //  死锁检测
-    // ══════════════════════════════════════════════════════
-
-    /**
-     * 检测是否存在循环依赖（两个任务互相等待对方的资源）
-     * 在当前简单模型下，主要检测：
-     *   1. 同一个 source 被多任务锁定
-     *   2. 同一个 target 存在冲突任务
-     */
-    checkDeadlocks: function () {
-        var issues = [];
-
-        // 检测 source 锁冲突
-        var locks = Memory.tasks.sourceLocks;
-        for (var sid in locks) {
-            var creepName = locks[sid];
-            var creep = Game.creeps[creepName];
-            if (!creep) {
-                // 持有锁的 creep 已死亡 → 自动释放
-                delete Memory.tasks.sourceLocks[sid];
-                issues.push('DEAD_CREEP_LOCK: ' + sid + ' ← ' + creepName + ' (released)');
-            }
-        }
-
-        // 检测被超时任务占用的锁
-        var tasks = Memory.tasks.active;
-        var now = Game.time;
-        for (var id in tasks) {
-            var t = tasks[id];
-            if (
-                t.status === this.STATUS.ASSIGNED &&
-                t.assignedCreep &&
-                t.startedAt &&
-                now - t.startedAt > this.TASK_TIMEOUT * 0.5
-            ) {
-                issues.push('STALLED: ' + id + ' → ' + t.assignedCreep
-                    + ' (' + (now - t.startedAt) + ' ticks)');
-            }
-        }
-
-        if (issues.length > 0) {
-            this._log('DEADLOCK', issues.join(' | '));
-        }
-        return issues;
-    },
-
-    // ══════════════════════════════════════════════════════
-    //  查询与统计
-    // ══════════════════════════════════════════════════════
-
-    /**
-     * 按状态获取任务列表
-     * @param {string} [status] - 过滤状态
-     * @returns {Task[]}
-     */
-    getTasks: function (status) {
         this.init();
-        var result = [];
-        var tasks = Memory.tasks.active;
-        for (var id in tasks) {
-            if (!status || tasks[id].status === status) {
-                result.push(tasks[id]);
-            }
-        }
-        return result;
-    },
+        var t = Memory.tasks.active[taskId];
+        if (!t) return false;
 
-    /**
-     * 获取调度统计信息
-     * @returns {{ active: number, completed: number, failed: number, avgDuration: number }}
-     */
-    getStats: function () {
-        this.init();
-        return {
-            active:      Object.keys(Memory.tasks.active).length,
-            completed:   Memory.tasks.stats.totalCompleted,
-            failed:      Memory.tasks.stats.totalFailed,
-            avgDuration: Memory.tasks.stats.avgDuration,
-        };
-    },
-
-    /**
-     * 获取已分配给某 creep 的任务
-     * @param {string} creepName
-     * @returns {Task|null}
-     */
-    getCreepTask: function (creepName) {
-        var tasks = Memory.tasks.active;
-        for (var id in tasks) {
-            if (tasks[id].assignedCreep === creepName) {
-                return tasks[id];
-            }
-        }
-        return null;
-    },
-
-    /**
-     * 释放 creep 持有的所有任务
-     * @param {string} creepName
-     */
-    releaseCreep: function (creepName) {
-        var tasks = Memory.tasks.active;
-        for (var id in tasks) {
-            if (tasks[id].assignedCreep === creepName) {
-                var t = tasks[id];
-                this._releaseLock(t);
-                t.status = this.STATUS.PENDING;
-                t.assignedCreep = null;
-                t.startedAt = null;
-                this._log('RELEASE', id + ' ← ' + creepName);
-            }
-        }
-    },
-
-    // ══════════════════════════════════════════════════════
-    //  让位协调（驱离非采集者 / 调整采集者站位）
-    // ══════════════════════════════════════════════════════
-
-    /**
-     * 请求 source 附近的 creep 让位
-     * 优先驱离非采集者;其次调整采集者站位
-     * @param {Creep} requester - 发起让位请求的 creep
-     * @param {Source} source   - 目标 source
-     * @returns {boolean} true=已发出让位指令
-     */
-    requestYield: function (requester, source) {
-        var nearby = source.pos.findInRange(FIND_CREEPS, 1);
-        var target = null;
-
-        // 第一优先级:非采集者(transporter/upgrader/builder/repairer)
-        for (var i = 0; i < nearby.length; i++) {
-            var c = nearby[i];
-            if (c.name === requester.name) continue;
-            if (this.YIELDABLE_ROLES.indexOf(c.memory.role) !== -1) {
-                target = c;
-                break;
-            }
-        }
-
-        // 第二优先级:其他 collector(调整站位)
-        if (!target) {
-            for (var j = 0; j < nearby.length; j++) {
-                var cc = nearby[j];
-                if (cc.name === requester.name) continue;
-                if (cc.memory.role === 'collector') {
-                    target = cc;
-                    break;
-                }
-            }
-        }
-
-        if (!target) return false;
-
-        // 计算让位目标点(source 周围 YIELD_DISTANCE 格外的空地)
-        var yieldPos = this._findYieldPosition(source);
-        if (!yieldPos) return false;
-
-        target.memory._yieldUntil    = Game.time + this.YIELD_TICKS;
-        target.memory._yieldSourceId = source.id;
-        target.memory._yieldTarget   = yieldPos;
-        this._log('YIELD', target.name + ' 让位给 ' + requester.name + ' @ source ' + source.id);
+        t.status = status;
+        if (progressCurrent != null) t.progressCurrent = progressCurrent;
+        if (progressTotal != null)   t.progressTotal = progressTotal;
+        if (error != null)           t.error = error;
         return true;
     },
 
     /**
-     * 在 source 附近 YIELD_DISTANCE 格外找一个空地作为让位目标
-     * @param {Source} source
-     * @returns {{x:number,y:number,roomName:string}|null}
+     * 完成任务，释放锁，归档，更新统计
+     * @param {string} taskId
      */
-    _findYieldPosition: function (source) {
-        // 由近到远遍历 source 周围外圈,选第一个非墙非 creep 的格子
-        for (var r = this.YIELD_DISTANCE; r <= this.YIELD_DISTANCE + 2; r++) {
-            for (var dx = -r; dx <= r; dx++) {
-                for (var dy = -r; dy <= r; dy++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue; // 只看外圈
-                    var x = source.pos.x + dx;
-                    var y = source.pos.y + dy;
-                    if (x < 1 || y < 1 || x > 49 || y > 49) continue;
-                    var look = source.room.lookAt(x, y);
-                    var blocked = false;
-                    for (var k = 0; k < look.length; k++) {
-                        if (look[k].type === 'terrain' && look[k].terrain === 'wall') { blocked = true; break; }
-                        if (look[k].type === 'creep') { blocked = true; break; }
+    completeTask: function (taskId) {
+        this.init();
+        var t = Memory.tasks.active[taskId];
+        if (!t) return false;
+
+        // 释放 source 锁
+        if (t.sourceId && Memory.tasks.sourceLocks[t.sourceId] === t.assignedTo) {
+            delete Memory.tasks.sourceLocks[t.sourceId];
+        }
+        // 释放 target 锁
+        if (t.targetId) {
+            this._releaseTargetLock(t.targetId, t.assignedTo);
+        }
+
+        // 归档
+        t.status = STATUS.COMPLETED;
+        t.completedAt = Game.time;
+        Memory.tasks.completed[taskId] = t;
+        delete Memory.tasks.active[taskId];
+        Memory.tasks.stats.completed++;
+        return true;
+    },
+
+    /**
+     * 标记任务失败，未超重试次数则重置为 PENDING
+     * @param {string} taskId
+     * @param {string} [error]
+     */
+    failTask: function (taskId, error) {
+        this.init();
+        var t = Memory.tasks.active[taskId];
+        if (!t) return false;
+
+        t.error = error || 'unknown';
+
+        // 释放锁
+        if (t.sourceId && Memory.tasks.sourceLocks[t.sourceId] === t.assignedTo) {
+            delete Memory.tasks.sourceLocks[t.sourceId];
+        }
+        if (t.targetId) {
+            this._releaseTargetLock(t.targetId, t.assignedTo);
+        }
+
+        t.retries = (t.retries || 0) + 1;
+        if (t.retries < (t.maxRetries || 3)) {
+            // 重试：重置为 pending
+            t.status = STATUS.PENDING;
+            t.assignedTo = null;
+            t.assignedAt = null;
+        } else {
+            // 超过重试次数 → 归档为失败
+            t.status = STATUS.FAILED;
+            t.completedAt = Game.time;
+            Memory.tasks.completed[taskId] = t;
+            delete Memory.tasks.active[taskId];
+            Memory.tasks.stats.failed++;
+        }
+        return true;
+    },
+
+    // ════════════════════════════════════════════════════
+    //  超时与死锁检测
+    // ════════════════════════════════════════════════════
+
+    /**
+     * 回收超时任务
+     * 应在 main.js 每 tick 调用
+     */
+    checkTimeouts: function () {
+        if (!Memory.tasks || !Memory.tasks.active) return;
+        var now = Game.time;
+
+        for (var tid in Memory.tasks.active) {
+            var t = Memory.tasks.active[tid];
+            // assigned/in_progress 状态超时
+            if ((t.status === STATUS.ASSIGNED || t.status === STATUS.IN_PROGRESS)
+                && t.assignedAt && now - t.assignedAt > TASK_TIMEOUT) {
+                t.error = '超时 (' + (now - t.assignedAt) + ' ticks)';
+                t.status = STATUS.TIMED_OUT;
+                t.completedAt = now;
+                Memory.tasks.completed[tid] = t;
+                delete Memory.tasks.active[tid];
+                Memory.tasks.stats.timedOut++;
+
+                // 释放锁
+                if (t.sourceId && Memory.tasks.sourceLocks[t.sourceId] === t.assignedTo) {
+                    delete Memory.tasks.sourceLocks[t.sourceId];
+                }
+                if (t.targetId) {
+                    this._releaseTargetLock(t.targetId, t.assignedTo);
+                }
+            }
+        }
+    },
+
+    /**
+     * 死锁检测（死 creep 持锁、停滞任务）
+     * 应在 main.js 每 tick 调用
+     */
+    checkDeadlocks: function () {
+        if (!Memory.tasks) return;
+
+        // 1. 检查 sourceLocks：持锁 creep 是否存活
+        if (Memory.tasks.sourceLocks) {
+            for (var sid in Memory.tasks.sourceLocks) {
+                var holder = Memory.tasks.sourceLocks[sid];
+                if (!holder || !Game.creeps[holder]) {
+                    delete Memory.tasks.sourceLocks[sid];
+                }
+            }
+        }
+
+        // 2. 检查 targetLocks：持锁 creep 是否存活
+        if (Memory.tasks.targetLocks) {
+            for (var tid in Memory.tasks.targetLocks) {
+                var holders = Memory.tasks.targetLocks[tid];
+                if (Array.isArray(holders)) {
+                    Memory.tasks.targetLocks[tid] = holders.filter(function (name) {
+                        return name && Game.creeps[name];
+                    });
+                    if (Memory.tasks.targetLocks[tid].length === 0) {
+                        delete Memory.tasks.targetLocks[tid];
                     }
-                    if (!blocked) {
-                        return { x: x, y: y, roomName: source.pos.roomName };
+                } else if (typeof holders === 'string') {
+                    if (!Game.creeps[holders]) {
+                        delete Memory.tasks.targetLocks[tid];
                     }
                 }
             }
         }
-        return null;
+
+        // 3. 检查 active 任务：assignedTo 的 creep 是否存活
+        if (Memory.tasks.active) {
+            for (var taskId in Memory.tasks.active) {
+                var t = Memory.tasks.active[taskId];
+                if ((t.status === STATUS.ASSIGNED || t.status === STATUS.IN_PROGRESS)
+                    && t.assignedTo && !Game.creeps[t.assignedTo]) {
+                    // 持有者已死亡 → 重置为 pending 或失败
+                    t.retries = (t.retries || 0) + 1;
+                    if (t.retries < (t.maxRetries || 3)) {
+                        t.status = STATUS.PENDING;
+                        t.assignedTo = null;
+                        t.assignedAt = null;
+                    } else {
+                        t.status = STATUS.FAILED;
+                        t.error = '持有者死亡';
+                        t.completedAt = Game.time;
+                        Memory.tasks.completed[taskId] = t;
+                        delete Memory.tasks.active[taskId];
+                        Memory.tasks.stats.failed++;
+                    }
+                }
+            }
+        }
     },
 
     /**
-     * 检查 creep 是否处于让位状态,若是则执行让位移动
-     * 各角色 run() 入口调用,返回 true 时本 tick 跳过正常逻辑
+     * 释放 creep 持有的所有任务与锁
+     * @param {string} creepName
+     */
+    releaseCreep: function (creepName) {
+        if (!Memory.tasks) return;
+
+        // 释放 source 锁
+        if (Memory.tasks.sourceLocks) {
+            for (var sid in Memory.tasks.sourceLocks) {
+                if (Memory.tasks.sourceLocks[sid] === creepName) {
+                    delete Memory.tasks.sourceLocks[sid];
+                }
+            }
+        }
+
+        // 释放 target 锁
+        if (Memory.tasks.targetLocks) {
+            for (var tid in Memory.tasks.targetLocks) {
+                var holders = Memory.tasks.targetLocks[tid];
+                if (Array.isArray(holders)) {
+                    Memory.tasks.targetLocks[tid] = holders.filter(function (n) { return n !== creepName; });
+                    if (Memory.tasks.targetLocks[tid].length === 0) {
+                        delete Memory.tasks.targetLocks[tid];
+                    }
+                } else if (holders === creepName) {
+                    delete Memory.tasks.targetLocks[tid];
+                }
+            }
+        }
+
+        // 重置该 creep 持有的任务
+        if (Memory.tasks.active) {
+            for (var taskId in Memory.tasks.active) {
+                var t = Memory.tasks.active[taskId];
+                if (t.assignedTo === creepName) {
+                    t.retries = (t.retries || 0) + 1;
+                    if (t.retries < (t.maxRetries || 3)) {
+                        t.status = STATUS.PENDING;
+                        t.assignedTo = null;
+                        t.assignedAt = null;
+                    } else {
+                        t.status = STATUS.FAILED;
+                        t.error = 'creep 释放';
+                        t.completedAt = Game.time;
+                        Memory.tasks.completed[taskId] = t;
+                        delete Memory.tasks.active[taskId];
+                        Memory.tasks.stats.failed++;
+                    }
+                }
+            }
+        }
+    },
+
+    // ════════════════════════════════════════════════════
+    //  让位协调
+    // ════════════════════════════════════════════════════
+
+    /**
+     * 请求 source 附近 creep 让位
+     * 优先驱离非采集者（transporter/upgrader/builder/repairer），
+     * 其次调整其他 collector 的站位
+     * @param {Creep} requester - 请求者（通常是 collector）
+     * @param {Source} source - 被阻塞的 source
+     * @returns {boolean} 是否找到让位者
+     */
+    requestYield: function (requester, source) {
+        if (!source) return false;
+
+        // 查找 source 附近 1 格内的所有 creep
+        var nearby = source.pos.findInRange(FIND_CREEPS, 1);
+        if (nearby.length === 0) return false;
+
+        // 优先驱离非采集者
+        for (var i = 0; i < nearby.length; i++) {
+            var c = nearby[i];
+            if (c.name === requester.name) continue;
+            if (!c.my) continue;
+
+            var role = c.memory.role;
+            if (YIELDABLE_ROLES.indexOf(role) !== -1) {
+                // 找到让位目标
+                var yieldPos = this._findYieldPosition(source);
+                if (yieldPos) {
+                    c.memory._yieldUntil = Game.time + YIELD_TICKS;
+                    c.memory._yieldTarget = yieldPos;
+                    this._log('请求 ' + c.name + ' (' + role + ') 让位，目标: ' + yieldPos.x + ',' + yieldPos.y);
+                    return true;
+                }
+            }
+        }
+
+        // 其次调整其他 collector 的站位
+        for (var j = 0; j < nearby.length; j++) {
+            var other = nearby[j];
+            if (other.name === requester.name) continue;
+            if (!other.my) continue;
+            if (other.memory.role === 'collector' || other.memory.role === 'harvester') {
+                var pos = this._findYieldPosition(source);
+                if (pos) {
+                    other.memory._yieldUntil = Game.time + YIELD_TICKS;
+                    other.memory._yieldTarget = pos;
+                    this._log('请求 ' + other.name + ' (采集者) 调整站位，目标: ' + pos.x + ',' + pos.y);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    },
+
+    /**
+     * 检查 creep 是否处于让位状态，是则执行让位移动并返回 true
+     * 各角色 run() 入口调用此方法
      * @param {Creep} creep
-     * @returns {boolean}
+     * @returns {boolean} true=正在让位，跳过本 tick 正常逻辑
      */
     checkYield: function (creep) {
         if (!creep.memory._yieldUntil) return false;
-
-        // 让位已过期 → 清理
-        if (Game.time >= creep.memory._yieldUntil) {
+        if (Game.time > creep.memory._yieldUntil) {
+            // 让位期结束 → 清理标记
             delete creep.memory._yieldUntil;
-            delete creep.memory._yieldSourceId;
             delete creep.memory._yieldTarget;
             return false;
         }
@@ -514,167 +548,93 @@ var taskScheduler = {
         // 仍在让位期 → 移动到让位目标
         var target = creep.memory._yieldTarget;
         if (target) {
-            var pos = new RoomPosition(target.x, target.y, target.roomName);
-            if (!creep.pos.isEqualTo(pos)) {
+            var pos = new RoomPosition(target.x, target.y, target.roomName || creep.room.name);
+            if (creep.pos.x !== pos.x || creep.pos.y !== pos.y || creep.pos.roomName !== pos.roomName) {
                 creep.moveTo(pos, {
                     visualizePathStyle: { stroke: '#ff4444', lineStyle: 'dashed' },
-                    reusePath: 1,
+                    reusePath: 5,
                 });
             }
+            return true;
         }
-        return true;
-    },
 
-    // ══════════════════════════════════════════════════════
-    //  动态任务创建（各角色专用快捷方法）
-    // ══════════════════════════════════════════════════════
-
-    /**
-     * 为 transporter 创建运输任务
-     * @param {string} sourceId   — 取货源（dropped resource / container / storage / tombstone）
-     * @param {string} targetId   — 送货目标（spawn / extension / tower / storage）
-     * @param {number} priority   — 优先级
-     * @param {number} amount     — 运输量
-     * @returns {string|null}
-     */
-    createTransportTask: function (sourceId, targetId, priority, amount) {
-        return this.createTask(
-            this.TASK_TYPES.TRANSPORT,
-            priority,
-            sourceId,
-            targetId,
-            RESOURCE_ENERGY,
-            amount || 0,
-            2
-        );
-    },
-
-    /**
-     * 为 collector 创建采集任务（将一个 source 分配给 collector）
-     * @param {string} sourceId
-     * @param {string} containerId  — 就近的 container（可选）
-     * @returns {string|null}
-     */
-    createCollectTask: function (sourceId, containerId) {
-        return this.createTask(
-            this.TASK_TYPES.COLLECT,
-            this.PRIORITY.NORMAL,
-            sourceId,
-            containerId || '',
-            RESOURCE_ENERGY,
-            0,
-            1
-        );
-    },
-
-    // ══════════════════════════════════════════════════════
-    //  内部辅助方法
-    // ══════════════════════════════════════════════════════
-
-    /**
-     * 检查是否有相同 source→target 的活跃任务（去重）
-     */
-    _hasDuplicate: function (type, sourceId, targetId) {
-        var tasks = Memory.tasks.active;
-        for (var id in tasks) {
-            var t = tasks[id];
-            if (
-                t.type === type &&
-                t.sourceId === sourceId &&
-                t.targetId === targetId &&
-                t.status !== this.STATUS.COMPLETED &&
-                t.status !== this.STATUS.FAILED &&
-                t.status !== this.STATUS.TIMED_OUT
-            ) {
-                return true;
-            }
-        }
+        // 无让位目标 → 清理标记
+        delete creep.memory._yieldUntil;
+        delete creep.memory._yieldTarget;
         return false;
     },
 
     /**
-     * 检查 source 是否已被其他 creep 锁定
+     * 在 source 外圈（YIELD_DISTANCE 格外）找空地作为让位目标
+     * 用 lookAtArea 一次性查找，避免多次 lookAt
+     * @param {Source} source
+     * @returns {{x:number,y:number,roomName:string}|null}
      */
-    _isSourceLocked: function (sourceId) {
-        var lock = Memory.tasks.sourceLocks[sourceId];
-        if (!lock) return false;
-        // 验证持有锁的 creep 仍存活
-        if (!Game.creeps[lock]) {
-            delete Memory.tasks.sourceLocks[sourceId];
-            return false;
-        }
-        return true;
-    },
+    _findYieldPosition: function (source) {
+        var sx = source.pos.x, sy = source.pos.y;
+        var room = source.room;
 
-    /**
-     * 检查 target 是否已有冲突任务
-     */
-    _hasTargetConflict: function (targetId, creepName) {
-        if (!Memory.tasks.targetLocks[targetId]) return false;
-        var lockList = Memory.tasks.targetLocks[targetId];
-        for (var i = 0; i < lockList.length; i++) {
-            var tid = lockList[i];
-            var t = Memory.tasks.active[tid];
-            if (t && t.assignedCreep !== creepName &&
-                t.status !== this.STATUS.COMPLETED &&
-                t.status !== this.STATUS.FAILED) {
-                return true;
+        // 从 YIELD_DISTANCE 到 YIELD_DISTANCE+2 的外圈逐层查找
+        for (var r = YIELD_DISTANCE; r <= YIELD_DISTANCE + 2; r++) {
+            var minX = Math.max(0, sx - r);
+            var maxX = Math.min(49, sx + r);
+            var minY = Math.max(0, sy - r);
+            var maxY = Math.min(49, sy + r);
+
+            // 一次性获取整个区域的 look 结果
+            var look = room.lookAtArea(minY, minX, maxY, maxX, true);
+
+            for (var i = 0; i < look.length; i++) {
+                var e = look[i];
+                // 只检查外圈格（Chebyshev 距离 = r）
+                var dx = Math.abs(e.x - sx);
+                var dy = Math.abs(e.y - sy);
+                if (Math.max(dx, dy) !== r) continue;
+
+                // 检查该格是否可站立
+                if (e.type === 'terrain' && e.terrain === 'wall') continue;
+                if (e.type === 'structure' && e.structure.structureType !== STRUCTURE_ROAD
+                    && e.structure.structureType !== STRUCTURE_RAMPART) continue;
+
+                // 检查该格是否有 creep（需要额外查询，lookAtArea 的 creep 结果可能不全）
+                var creepsHere = room.lookForAt(LOOK_CREEPS, e.x, e.y);
+                if (creepsHere.length > 0) continue;
+
+                return { x: e.x, y: e.y, roomName: room.name };
             }
         }
-        return false;
+
+        return null;
     },
 
-    /**
-     * 释放任务占用的所有锁
-     */
-    _releaseLock: function (task) {
-        // 释放 source 锁
-        if (Memory.tasks.sourceLocks[task.sourceId] === task.assignedCreep) {
-            delete Memory.tasks.sourceLocks[task.sourceId];
-        }
-        // 从 targetLocks 移除
-        if (Memory.tasks.targetLocks[task.targetId]) {
-            var list = Memory.tasks.targetLocks[task.targetId];
-            var idx = list.indexOf(task.id);
-            if (idx !== -1) list.splice(idx, 1);
-            if (list.length === 0) delete Memory.tasks.targetLocks[task.targetId];
-        }
-    },
+    // ════════════════════════════════════════════════════
+    //  锁管理（内部）
+    // ════════════════════════════════════════════════════
 
     /**
-     * 将已完成/失败的任务移至 completed 区域
+     * 释放 target 锁
+     * @param {string} targetId
+     * @param {string} creepName
      */
-    _archive: function (task) {
-        delete Memory.tasks.active[task.id];
-        Memory.tasks.completed[task.id] = {
-            type:        task.type,
-            status:      task.status,
-            priority:    task.priority,
-            createdAt:   task.createdAt,
-            completedAt: task.completedAt,
-            retries:     task.retryCount,
-            lastError:   task.lastError,
-        };
-    },
-
-    /**
-     * 垃圾回收：清除过期的已完成任务记录
-     */
-    _gc: function () {
-        var completed = Memory.tasks.completed;
-        var cutoff = Game.time - this.TASK_RETENTION;
-        for (var id in completed) {
-            if (completed[id].completedAt < cutoff) {
-                delete completed[id];
+    _releaseTargetLock: function (targetId, creepName) {
+        if (!Memory.tasks.targetLocks || !Memory.tasks.targetLocks[targetId]) return;
+        var holders = Memory.tasks.targetLocks[targetId];
+        if (Array.isArray(holders)) {
+            Memory.tasks.targetLocks[targetId] = holders.filter(function (n) { return n !== creepName; });
+            if (Memory.tasks.targetLocks[targetId].length === 0) {
+                delete Memory.tasks.targetLocks[targetId];
             }
+        } else if (holders === creepName) {
+            delete Memory.tasks.targetLocks[targetId];
         }
     },
 
-    /**
-     * 结构化日志
-     */
-    _log: function (level, message) {
-        console.log('[TaskScheduler|' + level + '] ' + message);
+    // ════════════════════════════════════════════════════
+    //  日志
+    // ════════════════════════════════════════════════════
+
+    _log: function (msg) {
+        console.log('[TaskScheduler] ' + msg);
     },
 };
 
