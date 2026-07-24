@@ -20,9 +20,6 @@ var DEFENSE_HITS_TARGET = 50000;
 /** Tower 最低能量阈值（低于此比例不维修，保留能量用于防御） */
 var TOWER_MIN_ENERGY_RATIO = 0.5;
 
-/** 是否开启调试日志 */
-var DEBUG = true;
-
 // ── 模块 ────────────────────────────────────────────────
 
 var state = require('state');
@@ -83,24 +80,25 @@ var managerTower = {
 
     /**
      * 单个防御塔的逻辑
+     * 用 RoomVisual 在塔上方显示状态文字（Tower 结构本身无 say 方法）
      */
     _runTower: function (tower) {
         var energy = tower.store[RESOURCE_ENERGY];
         var capacity = tower.store.getCapacity(RESOURCE_ENERGY);
         var energyRatio = capacity > 0 ? energy / capacity : 0;
+        var visual = new RoomVisual(tower.room.name);
 
         // 1. 最高优先级：攻击敌对 Creep（无论能量多少都尝试）
         var hostile = tower.pos.findClosestByRange(FIND_HOSTILE_CREEPS);
         if (hostile) {
             tower.attack(hostile);
+            this._say(visual, tower, '⚔ 攻击', '#ff4444');
             return;
         }
 
         // 能量不足时，只保留防御能力，不做维修
         if (energyRatio < TOWER_MIN_ENERGY_RATIO) {
-            if (DEBUG) {
-                console.log('[Tower] 能量不足(' + energy + '/' + capacity + ')，跳过维修，等待补充');
-            }
+            this._say(visual, tower, '⏸ 等待', '#ffaa00');
             return;
         }
 
@@ -112,9 +110,7 @@ var managerTower = {
         });
         if (damaged) {
             tower.repair(damaged);
-            if (DEBUG) {
-                console.log('[Tower] 维修普通建筑: ' + damaged.structureType + ' 血量:' + damaged.hits + '/' + damaged.hitsMax);
-            }
+            this._say(visual, tower, '🔧 修建筑', '#00aaff');
             return;
         }
 
@@ -125,22 +121,22 @@ var managerTower = {
         });
         if (defense) {
             tower.repair(defense);
-            if (DEBUG) {
-                console.log('[Tower] 维修防御建筑: ' + defense.structureType + ' 血量:' + defense.hits + '/' + DEFENSE_HITS_TARGET);
-            }
+            this._say(visual, tower, '🛡 修防御', '#00ff00');
         } else {
-            // 没有需要维修的 Wall/Rampart
-            if (DEBUG) {
-                var walls = tower.room.find(FIND_STRUCTURES, {
-                    filter: s => s.structureType == STRUCTURE_WALL || s.structureType == STRUCTURE_RAMPART
-                });
-                if (walls.length === 0) {
-                    console.log('[Tower] 房间内无 Wall/Rampart，无法维修');
-                } else {
-                    console.log('[Tower] Wall/Rampart 血量均已达标(' + DEFENSE_HITS_TARGET + ')，当前数量:' + walls.length);
-                }
-            }
+            this._say(visual, tower, '✓ 已达标', '#888888');
         }
+    },
+
+    /**
+     * 在 Tower 上方显示状态文字（模拟喊话效果）
+     */
+    _say: function (visual, tower, text, color) {
+        visual.text(text, tower.pos.x, tower.pos.y - 1.5, {
+            color: color,
+            font: 0.6,
+            backgroundColor: 'rgba(0,0,0,0.5)',
+            padding: 0.1,
+        });
     }
 };
 

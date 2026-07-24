@@ -299,7 +299,7 @@ var roleTransporter = {
         } else if (result === ERR_NOT_IN_RANGE) {
             creep.memory.transporterState = 'MOVING_TO_PICKUP';
 
-        } else if (result === ERR_NOT_ENOUGH_RESOURCES || result === ERR_EMPTY) {
+        } else if (result === ERR_NOT_ENOUGH_RESOURCES) {
             // 资源已被取完 → 找下一个
             this._log(LOG_LEVEL.DEBUG, logCtx + ' 取货点已空: ' + pickupId);
             creep.memory._pickupId = null;
